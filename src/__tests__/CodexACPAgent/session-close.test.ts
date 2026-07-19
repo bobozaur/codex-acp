@@ -287,7 +287,11 @@ describe("ACP session close", () => {
     it("rejects an in-flight resume that completes after close", async () => {
         const {codexAcpAgent, codexAcpClient} = await createSession();
         const resume = deferred<SessionMetadata>();
-        vi.spyOn(codexAcpClient, "resumeSession").mockReturnValue(resume.promise);
+        const resumeStarted = deferred<void>();
+        vi.spyOn(codexAcpClient, "resumeSession").mockImplementation(() => {
+            resumeStarted.resolve();
+            return resume.promise;
+        });
         const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession");
 
         const resumePromise = codexAcpAgent.resumeSession({
@@ -295,6 +299,7 @@ describe("ACP session close", () => {
             cwd: "/test/cwd",
             mcpServers: [],
         });
+        await resumeStarted.promise;
 
         await codexAcpAgent.closeSession({sessionId});
         resume.resolve(createSessionMetadata());
@@ -308,8 +313,12 @@ describe("ACP session close", () => {
     it("does not let a stale resume unsubscribe a newer reopened session", async () => {
         const {codexAcpAgent, codexAcpClient} = await createSession();
         const staleResume = deferred<SessionMetadata>();
+        const resumeStarted = deferred<void>();
         vi.spyOn(codexAcpClient, "resumeSession")
-            .mockReturnValueOnce(staleResume.promise)
+            .mockImplementationOnce(() => {
+                resumeStarted.resolve();
+                return staleResume.promise;
+            })
             .mockResolvedValueOnce(createSessionMetadata());
         const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession");
 
@@ -318,6 +327,7 @@ describe("ACP session close", () => {
             cwd: "/test/cwd",
             mcpServers: [],
         });
+        await resumeStarted.promise;
 
         await codexAcpAgent.closeSession({sessionId});
         await codexAcpAgent.resumeSession({
@@ -337,8 +347,12 @@ describe("ACP session close", () => {
         const {codexAcpAgent, codexAcpClient} = await createSession();
         const staleResume = deferred<SessionMetadata>();
         const staleUnsubscribe = deferred<void>();
+        const resumeStarted = deferred<void>();
         const resumeSpy = vi.spyOn(codexAcpClient, "resumeSession")
-            .mockReturnValueOnce(staleResume.promise)
+            .mockImplementationOnce(() => {
+                resumeStarted.resolve();
+                return staleResume.promise;
+            })
             .mockResolvedValueOnce(createSessionMetadata());
         const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession")
             .mockResolvedValueOnce()
@@ -349,6 +363,7 @@ describe("ACP session close", () => {
             cwd: "/test/cwd",
             mcpServers: [],
         });
+        await resumeStarted.promise;
 
         await codexAcpAgent.closeSession({sessionId});
         staleResume.resolve(createSessionMetadata());
@@ -383,7 +398,11 @@ describe("ACP session close", () => {
         const staleResume = deferred<SessionMetadata>();
         const activeUnsubscribe = deferred<void>();
         const staleUnsubscribe = deferred<void>();
-        vi.spyOn(codexAcpClient, "resumeSession").mockReturnValue(staleResume.promise);
+        const resumeStarted = deferred<void>();
+        vi.spyOn(codexAcpClient, "resumeSession").mockImplementation(() => {
+            resumeStarted.resolve();
+            return staleResume.promise;
+        });
         const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession")
             .mockReturnValueOnce(activeUnsubscribe.promise)
             .mockReturnValueOnce(staleUnsubscribe.promise);
@@ -393,6 +412,7 @@ describe("ACP session close", () => {
             cwd: "/test/cwd",
             mcpServers: [],
         });
+        await resumeStarted.promise;
         const closePromise = codexAcpAgent.closeSession({sessionId});
 
         await vi.waitFor(() => {

@@ -20,7 +20,7 @@ import {
     type TranscriptEntry,
 } from './v2-prompt-harness';
 import type {ServerNotification} from '../../app-server';
-import type {CodexErrorInfo, ErrorNotification, ThreadGoal, TurnCompletedNotification} from '../../app-server/v2';
+import type {CodexErrorInfo, ErrorNotification, ThreadGoal, TurnCompletedNotification, TurnSteerParams} from '../../app-server/v2';
 import {expectConformingV2SessionUpdates} from './v2-session-update-guard';
 import {CodexAcpServer} from '../../CodexAcpServer';
 
@@ -49,6 +49,16 @@ async function insertPrompt(client: PromptSession, index: number, id = turnId) {
     client.emit(itemCompleted(userMessageItem(clientUserMessageId), id));
     const {messageId} = await response;
     return messageId as string;
+}
+
+function mockActiveTurnSteering(client: PromptSession, turnId: string, onSteer?: () => void): TurnSteerParams[] {
+    const requests: TurnSteerParams[] = [];
+    client.setCodexResponse("turn/steer", async params => {
+        requests.push(params as TurnSteerParams);
+        onSteer?.();
+        return {turnId};
+    });
+    return requests;
 }
 
 function turnError(codexErrorInfo: CodexErrorInfo, message: string, id = turnId): ServerNotification {
@@ -96,7 +106,7 @@ describe('session/prompt over ACP v2', () => {
         await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
         client.emit(turnStarted());
         // A user message from someone else in the same turn does not insert this prompt.
-        client.emit(itemCompleted(userMessageItem(null, "Other")));
+        client.emit(itemCompleted({...userMessageItem(null, "Other"), id: "other-user"}));
         await settle();
         expect(client.transcript.some(entry => "promptResponse" in entry)).toBe(false);
 
@@ -112,7 +122,10 @@ describe('session/prompt over ACP v2', () => {
         expect(messageId).toBe(clientUserMessageId);
         const userMessages = client.transcript.flatMap(entry => "sessionUpdate" in entry ? [entry.sessionUpdate] : [])
             .filter(update => update.sessionUpdate === "user_message_chunk");
-        expect(userMessages).toEqual([{sessionUpdate: "user_message_chunk", messageId, content: {type: "text", text: "Hello"}}]);
+        expect(userMessages).toEqual([
+            {sessionUpdate: "user_message_chunk", messageId: "other-user", content: {type: "text", text: "Other"}},
+            {sessionUpdate: "user_message_chunk", messageId, content: {type: "text", text: "Hello"}},
+        ]);
         // Foreground work starts before insertion; acceptance still waits for the user-message echo.
         expect(stateUpdates(client.transcript)).toEqual([{state: "running"}, {state: "idle", stopReason: "end_turn"}]);
         const running = indexOf(client.transcript, isState("running"));
@@ -931,22 +944,24 @@ describe('session/prompt over ACP v2', () => {
             .toMatchFileSnapshot('data/prompt-v2-plan-implementation-turn.json');
     });
 
-    it('leaves v1 session/prompt unchanged: no clientUserMessageId, answered at turn end', async () => {
+    it('answers v1 prompts at turn end while correlating shared user-message echoes', async () => {
         const client = await connectSession(1);
         closeClient = () => client.connection.close();
 
         const response = client.sendPrompt([{type: "text", text: "Hello"}]);
         await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
         client.emit(turnStarted());
-        client.emit(itemCompleted(userMessageItem(null)));
+        const clientUserMessageId = client.turnStartParams[0]!["clientUserMessageId"] as string;
+        client.emit(itemCompleted(userMessageItem(clientUserMessageId)));
         await settle();
         expect(client.transcript.some(entry => "promptResponse" in entry)).toBe(false);
         client.emit(turnCompleted());
         await response;
 
-        expect(client.turnStartParams[0]).not.toHaveProperty("clientUserMessageId");
+        expect(clientUserMessageId).toEqual(expect.any(String));
+        expect(sessionUpdates(client.transcript).filter(update => update.sessionUpdate === "user_message_chunk")).toEqual([]);
         expect(stateUpdates(client.transcript)).toEqual([]);
-        await expect(dump(client.transcript)).toMatchFileSnapshot('data/prompt-v2-v1-unchanged.json');
+        await expect(dump(client.transcript, clientUserMessageId)).toMatchFileSnapshot('data/prompt-v2-v1-unchanged.json');
     });
 
     it('adopts a prompt steered into an already-running unowned turn without a second `running` (J8)', async () => {
@@ -960,11 +975,13 @@ describe('session/prompt over ACP v2', () => {
         expect(stateUpdates(client.transcript)).toEqual([{state: "running"}]);
 
         const start = client.transcript.length;
-        client.setTurnStart(async () => ({turn: createTurn("inProgress", "goal-turn")}));
+        const steers = mockActiveTurnSteering(client, "goal-turn");
         const response = client.sendPrompt([{type: "text", text: "Hello"}]);
-        await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
+        await vi.waitFor(() => expect(steers).toHaveLength(1));
+        expect(steers[0]?.expectedTurnId).toBe("goal-turn");
+        expect(client.turnStartParams).toEqual([]);
 
-        const clientUserMessageId = client.turnStartParams[0]!["clientUserMessageId"] as string;
+        const clientUserMessageId = steers[0]!.clientUserMessageId!;
         client.emit(itemCompleted(userMessageItem(clientUserMessageId), "goal-turn"));
         const {messageId} = await response;
         expect(messageId).toBe(clientUserMessageId);
@@ -991,9 +1008,11 @@ describe('session/prompt over ACP v2', () => {
         expect(stateUpdates(client.transcript)).toEqual([{state: "running"}]);
 
         const start = client.transcript.length;
-        client.setTurnStart(async () => ({turn: createTurn("inProgress", "goal-turn")}));
+        const steers = mockActiveTurnSteering(client, "goal-turn");
         const response = client.sendPrompt([{type: "text", text: "Hello"}]);
-        await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
+        await vi.waitFor(() => expect(steers).toHaveLength(1));
+        expect(steers[0]?.expectedTurnId).toBe("goal-turn");
+        expect(client.turnStartParams).toEqual([]);
 
         // Codex drops the steered input: the adopted turn is interrupted before it lands.
         client.emit(turnFinished("interrupted", "goal-turn"));
@@ -1048,20 +1067,20 @@ describe('session/prompt over ACP v2', () => {
         closeClient = () => client.connection.close();
 
         client.emit(turnStarted("goal-turn"));
-        client.emit(itemCompleted(userMessageItem(null, "Other"), "goal-turn"));
+        client.emit(itemCompleted({...userMessageItem(null, "Other"), id: "other-user"}, "goal-turn"));
         await settle();
         expect(stateUpdates(client.transcript)).toEqual([{state: "running"}]);
 
         const start = client.transcript.length;
-        client.setTurnStart(async () => {
-            // More goal-turn activity arrives while `turn/start` is still pending.
-            client.emit(itemCompleted(userMessageItem(null, "More"), "goal-turn"));
-            return {turn: createTurn("inProgress", "goal-turn")};
+        const steers = mockActiveTurnSteering(client, "goal-turn", () => {
+            client.emit(itemCompleted({...userMessageItem(null, "More"), id: "more-user"}, "goal-turn"));
         });
         const response = client.sendPrompt([{type: "text", text: "Hello"}]);
-        await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
+        await vi.waitFor(() => expect(steers).toHaveLength(1));
+        expect(steers[0]?.expectedTurnId).toBe("goal-turn");
+        expect(client.turnStartParams).toEqual([]);
 
-        const clientUserMessageId = client.turnStartParams[0]!["clientUserMessageId"] as string;
+        const clientUserMessageId = steers[0]!.clientUserMessageId!;
         client.emit(itemCompleted(userMessageItem(clientUserMessageId), "goal-turn"));
         const {messageId} = await response;
         expect(messageId).toBe(clientUserMessageId);
@@ -1074,6 +1093,9 @@ describe('session/prompt over ACP v2', () => {
         expect(stateUpdates(transcript)).toEqual([{state: "idle", stopReason: "end_turn"}]);
         const userMessages = transcript.flatMap(entry => "sessionUpdate" in entry ? [entry.sessionUpdate] : [])
             .filter(update => update.sessionUpdate === "user_message_chunk");
-        expect(userMessages).toEqual([{sessionUpdate: "user_message_chunk", messageId, content: {type: "text", text: "Hello"}}]);
+        expect(userMessages).toEqual([
+            {sessionUpdate: "user_message_chunk", messageId: "more-user", content: {type: "text", text: "More"}},
+            {sessionUpdate: "user_message_chunk", messageId, content: {type: "text", text: "Hello"}},
+        ]);
     });
 });

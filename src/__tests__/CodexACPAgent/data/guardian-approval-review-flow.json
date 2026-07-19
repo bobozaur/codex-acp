@@ -47,6 +47,22 @@
     {
       "sessionId": "test-session-id",
       "update": {
+        "sessionUpdate": "agent_message_chunk",
+        "messageId": "guardian-warning:1",
+        "content": {
+          "type": "text",
+          "text": "Guardian warning: Automatic approval review approved (risk: low, authorization: medium): The command only lists files.\n\n"
+        }
+      }
+    }
+  ]
+}
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "test-session-id",
+      "update": {
         "sessionUpdate": "tool_call_update",
         "toolCallId": "guardian_assessment:review-1",
         "status": "completed",

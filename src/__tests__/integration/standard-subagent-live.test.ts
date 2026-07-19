@@ -7,7 +7,7 @@ import {join} from "node:path";
 import {Readable, Writable} from "node:stream";
 import {expect, it, vi} from "vitest";
 import {AgentMode} from "../../AgentMode";
-import {removeDirectoryWithRetry, writeCodexHomeConfig} from "../acp-test-utils";
+import {removeDirectoryWithRetry, stopTestCodexDaemon, writeCodexHomeConfig} from "../acp-test-utils";
 import {describeIntegration, INTEGRATION_MODEL_ID} from "./integration-fixture";
 import {functionCallResponse, startMockResponsesServer, textResponse} from "./mock-responses-server";
 
@@ -195,7 +195,8 @@ describeIntegration("integration: live standard subagents", () => {
             processHandle.kill("SIGTERM");
             if (processHandle.exitCode === null) await once(processHandle, "exit");
             await mock.close();
-            await removeDirectoryWithRetry(root);
+            await stopTestCodexDaemon(codexHome);
+            removeDirectoryWithRetry(root);
         }
     });
 });

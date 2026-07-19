@@ -4,7 +4,7 @@
 
 Use [OpenAI Codex](https://github.com/openai/codex) from [Agent Client Protocol](https://agentclientprotocol.com/) clients.
 
-`codex-acp` is a stdio ACP agent server. It starts the Codex App Server, translates ACP requests into Codex operations, and maps Codex events back into the client.
+`codex-acp` is a stdio ACP agent server. By default it starts `codex remote-control start` and connects to the shared daemon through `codex app-server proxy`. Explicit provider overrides use a dedicated Codex process. It translates ACP requests into Codex operations and maps Codex events back into the client.
 
 ## Features
 
@@ -69,7 +69,7 @@ The adapter advertises ACP auth methods during initialization. Clients can authe
 
 - `CODEX_API_KEY` - API key used when the API-key auth method is selected. Takes precedence over `OPENAI_API_KEY`.
 - `OPENAI_API_KEY` - fallback API key used when the API-key auth method is selected.
-- `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency.
+- `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency. The same executable is used for `remote-control start` and `app-server proxy`.
 - `CODEX_CONFIG` - JSON object merged into the Codex session config.
 - `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
 - `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.

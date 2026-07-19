@@ -130,6 +130,29 @@ describe('tool calls and messages over ACP v2', () => {
             .toMatchFileSnapshot('data/tool-calls-and-messages-v2-file-citations.json');
     });
 
+    it('recovers a completion suffix that finishes a streamed file citation', async () => {
+        const client = await connectSession();
+        closeClient = () => client.connection.close();
+        await startTurn(client);
+
+        client.emit({method: "item/agentMessage/delta", params: {
+            threadId: sessionId, turnId, itemId: "completed-citation", delta: "See :codex-file-cita",
+        }});
+        client.emit(itemCompleted({
+            type: "agentMessage",
+            id: "completed-citation",
+            text: "See :codex-file-citation{path=\"src/a.ts\"} for details.",
+            phase: "final_answer",
+            memoryCitation: null,
+            delivery: null,
+            questions: null,
+        }));
+        await finishTurn(client);
+
+        await expect(dump(updatesTagged(client, "agent_message_chunk")))
+            .toMatchFileSnapshot('data/tool-calls-and-messages-v2-completed-citation.json');
+    });
+
     it('sends an agent message that arrives whole, without deltas', async () => {
         const client = await connectSession();
         closeClient = () => client.connection.close();
@@ -150,6 +173,30 @@ describe('tool calls and messages over ACP v2', () => {
 
         await expect(dump(updatesTagged(client, "agent_message_chunk")))
             .toMatchFileSnapshot('data/tool-calls-and-messages-v2-without-deltas.json');
+    });
+
+    it.each(["ordinary", "review", "review-ended"] as const)('publishes remote user input while hiding internal review input (%s)', async scope => {
+        const client = await connectSession();
+        closeClient = () => client.connection.close();
+        await startTurn(client);
+
+        if (scope !== "ordinary") {
+            client.emit(itemCompleted({type: "enteredReviewMode", id: "entered-review", review: "current changes"}));
+        }
+        if (scope === "review-ended") {
+            client.emit(itemCompleted({type: "exitedReviewMode", id: "exited-review", review: ""}));
+        }
+        client.emit(itemCompleted({...userMessageItem(null, "Uncorrelated input"), id: "uncorrelated-user"}));
+        client.emit(itemCompleted({...userMessageItem("remote-client", "Remote input"), id: "remote-user"}));
+        await finishTurn(client);
+
+        const messages = updatesTagged(client, "user_message_chunk").filter(update =>
+            update.sessionUpdate === "user_message_chunk" && typeof update.messageId === "string"
+            && ["uncorrelated-user", "remote-user"].includes(update.messageId));
+        expect(messages).toEqual([
+            ...(scope === "review" ? [] : [{sessionUpdate: "user_message_chunk", messageId: "uncorrelated-user", content: {type: "text", text: "Uncorrelated input"}}]),
+            {sessionUpdate: "user_message_chunk", messageId: "remote-user", content: {type: "text", text: "Remote input"}},
+        ]);
     });
 
     it('sends a tool call create as a tool_call_update upsert and passes later updates through', async () => {

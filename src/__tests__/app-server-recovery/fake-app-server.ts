@@ -76,6 +76,7 @@ export class FakeConnection {
                 this.pending.push({method, params, resolve, reject});
             });
         },
+        sendNotification: () => {},
         onUnhandledNotification: (handler: (notification: unknown) => void) => {
             this.unhandledNotification = handler;
         },
@@ -85,8 +86,9 @@ export class FakeConnection {
             this.notificationListeners.set(method, listeners);
             return {dispose: () => listeners.delete(handler)};
         },
-        onRequest: (type: {method: string}, handler: (params: unknown) => Promise<unknown>) => {
-            this.requestHandlers.set(type.method, handler);
+        onRequest: (type: {method: string} | ((method: string, params: unknown) => Promise<unknown>), handler?: (params: unknown) => Promise<unknown>) => {
+            if (typeof type === "function") return;
+            this.requestHandlers.set(type.method, handler!);
         },
         onDispose: (listener: () => void) => {
             this.disposeListeners.add(listener);

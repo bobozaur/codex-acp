@@ -100,12 +100,12 @@ describe("Fast mode session config", () => {
     });
 
     it.each([
-        {serviceTier: "fast", enabled: true},
-        {serviceTier: "priority", enabled: true},
-        {serviceTier: "flex", enabled: false},
-        {serviceTier: null, enabled: false},
-        {serviceTier: "unknown", enabled: false},
-    ])("preserves Fast mode from the app-server tier $serviceTier through the first prompt", async ({serviceTier, enabled}) => {
+        {serviceTier: "fast", enabled: true, expectedTier: "fast"},
+        {serviceTier: "priority", enabled: true, expectedTier: "fast"},
+        {serviceTier: "flex", enabled: false, expectedTier: "flex"},
+        {serviceTier: null, enabled: false, expectedTier: null},
+        {serviceTier: "unknown", enabled: false, expectedTier: null},
+    ])("keeps Fast mode and the effective service tier for $serviceTier through the first prompt", async ({serviceTier, enabled, expectedTier}) => {
         const {fixture, response, codexAcpAgent} = await createSession(serviceTier);
         const turnStartSpy = mockPromptTurn(fixture, "session-id");
 
@@ -114,7 +114,7 @@ describe("Fast mode session config", () => {
         await codexAcpAgent.prompt({sessionId: "session-id", prompt: [{type: "text", text: "test"}]});
 
         expect(turnStartSpy).toHaveBeenCalledWith(expect.objectContaining({
-            serviceTier: enabled ? "fast" : null,
+            serviceTier: expectedTier,
         }));
     });
 

@@ -254,14 +254,28 @@ describe('Elicitation Events', () => {
             await promptPromise;
         });
 
-        it('should return cancel when no handler registered', async () => {
+        it('should not race a foreign elicitation before it is resolved elsewhere', async () => {
             const params: McpServerElicitationRequestParams = {
                 threadId: 'non-existent-session', turnId: null, serverName: 'test-server',
                 mode: 'form', _meta: null, message: 'Please provide info',
                 requestedSchema: { type: 'object', properties: {} },
             };
 
-            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            const responsePromise = fixture.sendServerRequest(
+                'mcpServer/elicitation/request',
+                params,
+                'foreign-elicitation',
+            );
+            let settled = false;
+            void responsePromise.then(() => { settled = true; });
+            await Promise.resolve();
+            expect(settled).toBe(false);
+            fixture.sendServerNotification({
+                method: 'serverRequest/resolved',
+                params: {threadId: params.threadId, requestId: 'foreign-elicitation'},
+            });
+
+            const response = await responsePromise;
             expect(response).toEqual({ action: 'cancel', content: null, _meta: null });
         });
 
@@ -327,7 +341,11 @@ describe('Elicitation Events', () => {
                 requestedSchema: { type: 'object', properties: {} },
             };
 
-            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            const response = await fixture.sendServerRequest(
+                'mcpServer/elicitation/request',
+                params,
+                'request-1',
+            );
             expect(response).toEqual({ action: 'accept', content: null, _meta: { persist: 'always' } });
 
             const events = fixture.getAcpConnectionEvents(['_meta']);
@@ -693,7 +711,19 @@ describe('Elicitation Events', () => {
             };
 
             fixture.sendServerNotification(startedNotification);
+            const interruptedRequest = fixture.sendServerRequest(
+                'mcpServer/elicitation/request',
+                {
+                    threadId: sessionId, turnId: 'turn-1', serverName: 'tool-server',
+                    mode: 'form',
+                    _meta: {codex_approval_kind: 'mcp_tool_call'},
+                    message: 'Allow interrupted tool call?',
+                    requestedSchema: {type: 'object', properties: {}},
+                },
+                'request-1',
+            );
             fixture.sendServerNotification(resolvedNotification);
+            await interruptedRequest;
             await fixture.getCodexAcpClient().waitForSessionNotifications(sessionId);
             fixture.clearAcpConnectionDump();
 
@@ -765,7 +795,11 @@ describe('Elicitation Events', () => {
                 url: 'https://example.com/authorize', elicitationId: 'elicit-123',
             };
 
-            const response = await fixture.sendServerRequest('mcpServer/elicitation/request', params);
+            const response = await fixture.sendServerRequest(
+                'mcpServer/elicitation/request',
+                params,
+                'request-1',
+            );
             expect(response).toEqual({ action: 'accept', content: null, _meta: { source: 'client' } });
 
             const [elicitationEvent] = fixture.getAcpConnectionEvents([]);

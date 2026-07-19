@@ -2,12 +2,13 @@ import * as acp from "@agentclientprotocol/sdk/unstable";
 import {existsSync, readFileSync} from "node:fs";
 import {mkdtemp, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
+import {once} from "node:events";
 import {join} from "node:path";
 import {describe, expect, it, vi} from "vitest";
 import {CodexAppServerClient} from "../../../CodexAppServerClient";
 import {prepareCodexHookConfig} from "../../../CodexHookConfig";
 import {CODEX_HOOKS_LIST_METHOD, CODEX_HOOKS_TRUST_METHOD, listCodexHooks, trustCodexHooks} from "../../../CodexHookTrust";
-import {startCodexConnection} from "../../../CodexJsonRpcConnection";
+import {startStdioCodexConnection} from "../../../CodexJsonRpcConnection";
 import type {HookMetadata} from "../../../app-server/v2/HookMetadata";
 import {requireLiveApiKey} from "./acp-e2e-test-utils";
 import {createSpawnedAgentFixture, type SpawnedAgentFixture} from "./spawned-agent-fixture";
@@ -40,7 +41,7 @@ describe.skipIf(process.env["RUN_E2E_TESTS"] !== "true")("ACP hook review", () =
         const config = prepareCodexHookConfig({
             hooks: {PostToolUse: [{matcher: "Bash", hooks: [{type: "command", command: "echo ready"}]}]},
         });
-        const connection = startCodexConnection(undefined, {...process.env, CODEX_HOME: home}, config.appServerStartupArgs);
+        const connection = startStdioCodexConnection(process.env["CODEX_PATH"], {...process.env, CODEX_HOME: home}, config.appServerStartupArgs);
         const client = new CodexAppServerClient(connection.connection);
         const userHook = async () => (await client.hooksList({cwds: [home]})).data[0]?.hooks.find(hook => hook.source === "user");
         try {
@@ -56,7 +57,13 @@ describe.skipIf(process.env["RUN_E2E_TESTS"] !== "true")("ACP hook review", () =
             expect(await userHook()).toMatchObject({command: "echo user", trustStatus: "untrusted"});
         } finally {
             connection.connection.dispose();
-            connection.process.kill();
+            const child = connection.process;
+            if (child.exitCode === null && child.signalCode === null) {
+                const exited = once(child, "exit");
+                const timeout = setTimeout(() => child.kill("SIGKILL"), 4_000);
+                child.kill();
+                try { await exited; } finally { clearTimeout(timeout); }
+            }
             await rm(home, {recursive: true, force: true});
         }
     }, 30_000);

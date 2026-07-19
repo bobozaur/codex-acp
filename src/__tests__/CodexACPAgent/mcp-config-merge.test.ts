@@ -4,8 +4,9 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import {once} from "node:events";
 import type {McpServerStdio} from "@agentclientprotocol/sdk/unstable";
-import {startCodexConnection} from "../../CodexJsonRpcConnection";
+import {type CodexConnection, startStdioCodexConnection} from "../../CodexJsonRpcConnection";
 import {createBaseTestFixture, removeDirectoryWithRetry, type TestFixture} from "../acp-test-utils";
 
 describe('MCP config merge across configured MCP servers and ACP request', { timeout: 40_000 }, () => {
@@ -13,6 +14,7 @@ describe('MCP config merge across configured MCP servers and ACP request', { tim
     let codexHome: string;
     let projectPath: string;
     let fixture: TestFixture;
+    let codexConnection: CodexConnection;
 
     beforeEach(() => {
         vi.clearAllMocks();
@@ -37,7 +39,7 @@ url = "https://example.com/mcp"
         fs.mkdirSync(path.join(projectPath, ".codex"));
         fs.writeFileSync(path.join(projectPath, ".codex", "config.toml"), projectConfig, "utf8");
 
-        const codexConnection = startCodexConnection(undefined, {
+        codexConnection = startStdioCodexConnection(process.env["CODEX_PATH"], {
             ...process.env,
             CODEX_HOME: codexHome,
         });
@@ -48,8 +50,16 @@ url = "https://example.com/mcp"
         });
     });
 
-    afterEach(() => {
+    afterEach(async () => {
         vi.unstubAllEnvs();
+        codexConnection.connection.dispose();
+        const child = codexConnection.process;
+        if (child.exitCode === null && child.signalCode === null) {
+            const exited = once(child, "exit");
+            const timeout = setTimeout(() => child.kill("SIGKILL"), 4_000);
+            child.kill();
+            try { await exited; } finally { clearTimeout(timeout); }
+        }
         removeDirectoryWithRetry(codexHome);
         removeDirectoryWithRetry(projectPath);
     });

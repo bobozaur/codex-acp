@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { once } from 'node:events';
 import * as acp from '@agentclientprotocol/sdk/unstable';
-import { startCodexConnection } from '../../CodexJsonRpcConnection';
+import { startStdioCodexConnection } from '../../CodexJsonRpcConnection';
 import { CodexAppServerClient } from '../../CodexAppServerClient';
 import { CodexAcpClient } from '../../CodexAcpClient';
 import { CodexAcpServer } from '../../CodexAcpServer';
@@ -13,10 +13,15 @@ import { createMockConnections } from './test-utils';
 describe('CodexACPAgent - process exit error', () => {
     it.skipIf(process.platform === 'win32')('includes the crashed process stderr', async () => {
         const fakeCodex = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bad-')), 'codex');
-        fs.writeFileSync(fakeCodex, "#!/bin/sh\necho 'codex: failed to launch' >&2\nexit 1\n");
+        fs.writeFileSync(fakeCodex, [
+            "#!/bin/sh",
+            "echo 'codex: failed to launch' >&2",
+            "exit 1",
+            "",
+        ].join("\n"));
         fs.chmodSync(fakeCodex, 0o755);
 
-        const connection = startCodexConnection(fakeCodex);
+        const connection = startStdioCodexConnection(fakeCodex);
         let stderr = '';
         connection.process.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
 

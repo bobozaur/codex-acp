@@ -91,7 +91,7 @@ describe('elicitation/create over ACP v2', () => {
         const {finishTurn} = await startRunningPrompt(client);
         const start = client.transcript.length;
 
-        const response = await client.triggerApproval('mcpServer/elicitation/request', oauthReauthParams());
+        const response = await client.triggerApproval('mcpServer/elicitation/request', oauthReauthParams(), "request-1");
 
         expect(response).toEqual({action: "accept", content: null, _meta: {source: "client"}});
         const transcript = client.transcript.slice(start);

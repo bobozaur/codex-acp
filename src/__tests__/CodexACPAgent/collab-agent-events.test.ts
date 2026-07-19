@@ -198,7 +198,7 @@ describe("CodexEventHandler - collab agent tool call events", () => {
             message: "Authorize legacy child",
             url: "https://example.com/legacy-child",
             elicitationId: "legacy-child-url",
-        });
+        }, 7);
         await mockFixture.sendServerNotification({
             method: "serverRequest/resolved",
             params: {threadId: "thread-paris", requestId: 7},

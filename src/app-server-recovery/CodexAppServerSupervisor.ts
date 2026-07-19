@@ -105,7 +105,11 @@ export class CodexAppServerSupervisor {
             env: Record<string, string>,
         ) => CodexConnection =
             (codexPath, appServerStartupArgs, env) =>
-                startCodexConnection(codexPath, {...process.env, ...env}, appServerStartupArgs, {disposeOnExit: false}),
+                startCodexConnection(codexPath, {...process.env, ...env}, appServerStartupArgs, {
+                    disposeOnExit: false,
+                    providerStartupConfig: state.providerStartupConfig ?? NO_PROVIDER_STARTUP_CONFIG,
+                    reuseSharedDaemon: true,
+                }),
         timings: Partial<SupervisorTimings> = {},
         private readonly now: () => number = Date.now,
     ) {

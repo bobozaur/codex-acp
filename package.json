@@ -41,6 +41,7 @@
     "test": "vitest run --no-file-parallelism --retry=2 --exclude 'src/__tests__/integration/**' --exclude '**/node_modules/**' --exclude '**/.git/**'",
     "test:integration": "vitest run --no-file-parallelism --hookTimeout=30000 src/__tests__/integration",
     "test:e2e": "npm run build && RUN_E2E_TESTS=true vitest run --no-file-parallelism --retry=2 src/__tests__/CodexACPAgent/e2e",
+    "test:remote-sync": "RUN_REMOTE_SYNC_TESTS=true vitest run --no-file-parallelism --disableConsoleIntercept src/__tests__/CodexACPAgent/remote-control-live.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit && tsc --noEmit -p examples/tsconfig.json",
     "codex-test": "tsx .agents/skills/run-codex/scripts/run-codex-test.ts"

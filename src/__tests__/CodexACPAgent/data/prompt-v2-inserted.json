@@ -42,6 +42,16 @@
     "codexNotification": "item/completed"
   },
   {
+    "sessionUpdate": {
+      "messageId": "other-user",
+      "content": {
+        "text": "Other",
+        "type": "text"
+      },
+      "sessionUpdate": "user_message_chunk"
+    }
+  },
+  {
     "codexNotification": "item/started"
   },
   {

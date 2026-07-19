@@ -1,5 +1,5 @@
 import {afterEach, describe, expect, it, vi} from "vitest";
-import type {ServerNotification} from "../../app-server";
+import type {RequestId, ServerNotification} from "../../app-server";
 import type {ThreadItem} from "../../app-server/v2";
 import {
     agentMessageDelta, commandExecutionItem, connectSession, codexResponse, createThread, createTurn, cwd,
@@ -67,10 +67,10 @@ describe.each([1, 2] as const)("ACP v%s live standard subagents", version => {
         await flush(h);
         await expect(JSON.stringify(childUpdates(), null, 2) + "\n").toMatchFileSnapshot(`data/live-core-v${version}-${name}.json`);
     }
-    const approval = (itemId: string, turnId = "child-turn") => h.triggerApproval("item/commandExecution/requestApproval", {
+    const approval = (itemId: string, turnId = "child-turn", requestId?: RequestId) => h.triggerApproval("item/commandExecution/requestApproval", {
         threadId: worker, turnId, itemId, command: "echo hello", cwd, commandActions: [],
         reason: null, availableDecisions: ["accept", "decline"],
-    });
+    }, requestId);
 
     it("preserves a child identity across idle and later work without publishing agent input as human input", async () => {
         await connect();
@@ -140,7 +140,7 @@ describe.each([1, 2] as const)("ACP v%s live standard subagents", version => {
         expect(await h.triggerApproval("mcpServer/elicitation/request", {
             threadId: worker, turnId: "child-turn", serverName: "auth", mode: "url", _meta: null,
             message: "Authorize", url: "https://example.com/authorize", elicitationId: "authorization",
-        })).toMatchObject({action: "accept"});
+        }, "authorization-request")).toMatchObject({action: "accept"});
         history(h);
         await load();
         expect(await approval("after")).toEqual({decision: "accept"});
@@ -223,7 +223,16 @@ describe.each([1, 2] as const)("ACP v%s live standard subagents", version => {
         h.emit(onWorker(turnStarted("child-turn")));
         await flush(h);
         if (parent === sessionId) expect(await approval("restored")).toEqual({decision: "accept"});
-        else expect(await approval("foreign")).toEqual({decision: "cancel"});
+        else {
+            const pending = approval("foreign", "child-turn", "foreign-request");
+            let settled = false;
+            void pending.then(() => { settled = true; });
+            await flush(h);
+            expect(settled).toBe(false);
+            expect(h.transcript.some(entry => "permissionRequest" in entry)).toBe(false);
+            h.emit({method: "serverRequest/resolved", params: {threadId: worker, requestId: "foreign-request"}});
+            await expect(pending).resolves.toEqual({decision: "cancel"});
+        }
         await snapshot(`ownership-${parent === sessionId ? "owned" : "foreign"}`);
     });
 

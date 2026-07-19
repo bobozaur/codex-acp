@@ -5,7 +5,7 @@ import {mkdirSync, mkdtempSync} from "node:fs";
 import {join} from "node:path";
 import {Readable, Writable} from "node:stream";
 import {expect, it, vi} from "vitest";
-import {removeDirectoryWithRetry, writeCodexHomeConfig} from "../acp-test-utils";
+import {removeDirectoryWithRetry, stopTestCodexDaemon, writeCodexHomeConfig} from "../acp-test-utils";
 import {describeIntegration, INTEGRATION_MODEL_ID} from "./integration-fixture";
 import {startMockResponsesServer, textResponse} from "./mock-responses-server";
 
@@ -139,6 +139,7 @@ describeIntegration("integration: ACP v2 foreground state", () => {
                 }
             }
             await mock.close();
+            await stopTestCodexDaemon(codexHome);
             removeDirectoryWithRetry(root);
         }
     });

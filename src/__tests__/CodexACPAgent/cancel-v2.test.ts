@@ -220,9 +220,10 @@ describe('session/cancel and session/close over ACP v2', () => {
         expect(stateUpdates(client.transcript)).toEqual([{state: "running"}]);
 
         const start = client.transcript.length;
-        client.setTurnStart(async () => ({turn: createTurn("inProgress", "goal-turn")}));
+        const steer = vi.spyOn(client.appServer, "turnSteer").mockResolvedValue({turnId: "goal-turn"});
         const response = client.sendPrompt([{type: "text", text: "Hello"}]);
-        await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
+        await vi.waitFor(() => expect(steer).toHaveBeenCalledWith(expect.objectContaining({expectedTurnId: "goal-turn"})));
+        expect(client.turnStartParams).toEqual([]);
 
         await client.cancel();
         // Codex drops the steered input: the adopted turn is interrupted before it lands.
@@ -326,10 +327,11 @@ describe('session/cancel and session/close over ACP v2', () => {
         expect(stateUpdates(client.transcript)).toEqual([{state: "running"}]);
 
         const start = client.transcript.length;
-        client.setTurnStart(async () => ({turn: createTurn("inProgress", "goal-turn")}));
+        const steer = vi.spyOn(client.appServer, "turnSteer").mockResolvedValue({turnId: "goal-turn"});
         const controller = new AbortController();
         const response = client.sendPrompt([{type: "text", text: "Hello"}], controller.signal);
-        await vi.waitFor(() => expect(client.turnStartParams).toHaveLength(1));
+        await vi.waitFor(() => expect(steer).toHaveBeenCalledWith(expect.objectContaining({expectedTurnId: "goal-turn"})));
+        expect(client.turnStartParams).toEqual([]);
 
         controller.abort();
         await expect(response).rejects.toMatchObject({code: -32800});

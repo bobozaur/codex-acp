@@ -3,7 +3,8 @@ import type {CreateElicitationResponse, McpServerStdio, RequestPermissionRespons
 import {CodexAcpClient} from '../CodexAcpClient';
 import {ToolCallReports} from "../ToolCallReports";
 import {CodexAppServerClient, type CodexConnectionEvent} from '../CodexAppServerClient';
-import {type CodexConnection, startCodexConnection} from "../CodexJsonRpcConnection";
+import {tagAppServerRequest} from '../AppServerRequestContext';
+import {type CodexConnection, startStdioCodexConnection} from "../CodexJsonRpcConnection";
 import {CodexAcpServer, type CodexProcessState, type SessionState} from "../CodexAcpServer";
 import {ACPSessionConnection, type AcpClientConnection} from "../ACPSessionConnection";
 import type {ServerNotification} from "../app-server";
@@ -11,9 +12,11 @@ import type {MessageConnection} from "vscode-jsonrpc/node";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import {createRequire} from "node:module";
+import crossSpawn from "cross-spawn";
 import {AgentMode} from "../AgentMode";
 import {DEFAULT_COLLABORATION_MODE} from "../CollaborationModeConfig";
-import {afterEach, beforeEach, expect, vi} from "vitest";
+import {afterEach, beforeEach, expect, onTestFinished, vi} from "vitest";
 import type {Model, ReasoningEffortOption} from "../app-server/v2";
 import {CodexSubagentEventRouter} from "../subagents/CodexSubagentEventRouter";
 import {CodexEventHandler} from "../CodexEventHandler";
@@ -96,6 +99,12 @@ export interface ConnectionConfig {
     getExitCode: () => number | null;
     acpConnection?: AcpConnectionConfig;
     codexProcessState?: CodexProcessState;
+}
+
+export interface TestCodexHomeOptions {
+    configExtras?: Record<string, string>;
+    mcpServers?: McpServerStdio[];
+    appendConfig?: string;
 }
 
 export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
@@ -190,7 +199,7 @@ export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
  * Creates a test fixture with a real Codex connection.
  * Use for integration tests that need to interact with the actual Codex binary.
  */
-export function createTestFixture(): TestFixture {
+export function createTestFixture(options: TestCodexHomeOptions = {}): TestFixture {
     const bundledCodexPath = path.resolve(
         process.cwd(),
         "node_modules",
@@ -203,14 +212,26 @@ export function createTestFixture(): TestFixture {
         throw new Error(`Codex binary not found at ${pathToCodex}. Did you run 'npm install'?`);
     }
 
-    const codexHome = createTestCodexHome();
-    const codexConnection = startCodexConnection(pathToCodex, {
+    const codexHome = createTestCodexHome(options);
+    const codexConnection = startStdioCodexConnection(pathToCodex, {
         ...process.env,
         CODEX_HOME: codexHome,
     });
-    codexConnection.process.on("exit", () => {
+
+    let cleanedUp = false;
+    const cleanup = () => {
+        if (cleanedUp) {
+            return;
+        }
+        cleanedUp = true;
+        codexConnection.connection.dispose();
+        if (codexConnection.process.exitCode === null && !codexConnection.process.killed) {
+            codexConnection.process.kill();
+        }
         removeDirectoryWithRetry(codexHome);
-    });
+    };
+    codexConnection.process.on("exit", cleanup);
+    onTestFinished(cleanup);
 
     return createBaseTestFixture({
         connection: codexConnection.connection,
@@ -218,9 +239,12 @@ export function createTestFixture(): TestFixture {
     });
 }
 
-function createTestCodexHome(): string {
+function createTestCodexHome(options: TestCodexHomeOptions): string {
     const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-acp-codex-home-"));
-    writeCodexHomeConfig(codexHome);
+    writeCodexHomeConfig(codexHome, options.configExtras ?? {}, options.mcpServers ?? []);
+    if (options.appendConfig) {
+        fs.appendFileSync(path.join(codexHome, "config.toml"), `\n${options.appendConfig}`, "utf8");
+    }
     return codexHome;
 }
 
@@ -255,6 +279,36 @@ function escapeTOML(value: string): string {
     return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/** Stops only the managed daemon belonging to an isolated spawned-agent fixture. */
+export async function stopTestCodexDaemon(codexHome: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+    const home = path.resolve(codexHome);
+    const roots = [path.join(process.cwd(), "tmp"), path.join(process.cwd(), "node_modules", ".cache", "codex-acp-tests")];
+    if (!roots.some(root => home.startsWith(`${root}${path.sep}`))) {
+        throw new Error(`Refusing to stop a Codex daemon outside an isolated test home: ${home}`);
+    }
+    const codexPath = env["CODEX_PATH"];
+    const args = [
+        ...(codexPath ? [] : [createRequire(import.meta.url).resolve("@openai/codex/bin/codex.js")]),
+        "remote-control", "stop",
+    ];
+    const child = crossSpawn(codexPath ?? process.execPath, args, {
+        env: {...env, CODEX_HOME: home},
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+        killSignal: "SIGKILL",
+    });
+    let output = "";
+    child.stdout?.on("data", chunk => { output += chunk.toString(); });
+    child.stderr?.on("data", chunk => { output += chunk.toString(); });
+    await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, signal) => {
+            if (code === 0) resolve();
+            else reject(new Error(`Failed to stop isolated Codex daemon (${signal ?? code}): ${output.trim()}`));
+        });
+    });
+}
+
 export function removeDirectoryWithRetry(directory: string): void {
     for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
@@ -271,7 +325,7 @@ export function removeDirectoryWithRetry(directory: string): void {
 
 export interface CodexMockTestFixture extends TestFixture {
     sendServerNotification(notification: ServerNotification | Record<string, unknown>): void,
-    sendServerRequest<T>(method: string, params: unknown): Promise<T>,
+    sendServerRequest<T>(method: string, params: unknown, requestId?: string | number): Promise<T>,
     setPermissionResponse(response: RequestPermissionResponse | Promise<RequestPermissionResponse>): void,
     setElicitationResponse(response: CreateElicitationResponse | Promise<CreateElicitationResponse>): void,
     /** Raw `options` (e.g. `cancellationSignal`) passed to `connection.request()` calls for the given ACP method. */
@@ -292,6 +346,8 @@ export function createCodexMockTestFixture(
     let unhandledNotificationHandler: ((notification: any) => void) | null = null;
     const requestHandlers = new Map<string, (params: unknown) => Promise<unknown>>();
     const disposeListeners = new Set<() => void>();
+    let starRequestHandler: ((method: string, params: unknown) => Promise<unknown>) | null = null;
+    let nextServerRequestId = 0;
 
     // State for controlling permission responses
     const permissionState: { response: RequestPermissionResponse | Promise<RequestPermissionResponse> } = {
@@ -305,12 +361,20 @@ export function createCodexMockTestFixture(
         sendRequest: (method: string) => Promise.resolve(
             method === "thread/backgroundTerminals/list" ? {data: [], nextCursor: null} : undefined,
         ),
+        sendNotification: () => {},
         onUnhandledNotification: (handler: (notification: any) => void) => {
             unhandledNotificationHandler = handler;
         },
         onNotification: () => {},
-        onRequest: (type: { method: string }, handler: (params: unknown) => Promise<unknown>) => {
-            requestHandlers.set(type.method, handler);
+        onRequest: (
+            type: {method: string} | ((method: string, params: unknown) => Promise<unknown>),
+            handler?: (params: unknown) => Promise<unknown>,
+        ) => {
+            if (typeof type === 'function') {
+                starRequestHandler = type;
+                return;
+            }
+            requestHandlers.set(type.method, handler!);
         },
         // As in vscode-jsonrpc, `dispose()` fires `onDispose`. The exit of the Codex process disposes the connection.
         onDispose: (listener: () => void) => {
@@ -375,11 +439,16 @@ export function createCodexMockTestFixture(
                 unhandledNotificationHandler(notification);
             }
         },
-        async sendServerRequest<T>(method: string, params: unknown): Promise<T> {
+        async sendServerRequest<T>(method: string, params: unknown, requestId?: string | number): Promise<T> {
             const handler = requestHandlers.get(method);
             if (!handler) {
-                throw new Error(`No handler registered for ${method}`);
+                if (!starRequestHandler) {
+                    throw new Error(`No handler registered for ${method}`);
+                }
+                tagAppServerRequest(params, requestId ?? ++nextServerRequestId);
+                return await starRequestHandler(method, params) as T;
             }
+            tagAppServerRequest(params, requestId ?? ++nextServerRequestId);
             return await handler(params) as T;
         },
         setPermissionResponse(response: RequestPermissionResponse | Promise<RequestPermissionResponse>): void {

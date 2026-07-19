@@ -22,6 +22,7 @@ export function createMockConnections(): MockConnections {
 
     const mockCodexConnection = {
         sendRequest: vi.fn(),
+        sendNotification: vi.fn(),
         onUnhandledNotification: vi.fn((handler: Function) => {
             unhandledNotificationHandler = handler;
         }),

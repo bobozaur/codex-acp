@@ -8,8 +8,10 @@ import type {
     InitializeParams,
     InitializeResponse,
     ReasoningEffort,
+    RequestId,
     ServerNotification
 } from "./app-server";
+import {getAppServerRequestId} from "./AppServerRequestContext";
 import type {
     ActivePermissionProfile,
     CancelLoginAccountParams,
@@ -91,10 +93,10 @@ import type {
     TurnCompletedNotification,
     TurnInterruptParams,
     TurnInterruptResponse,
-    TurnStartParams,
-    TurnStartResponse,
     TurnSteerParams,
     TurnSteerResponse,
+    TurnStartParams,
+    TurnStartResponse,
     CommandExecutionRequestApprovalParams,
     CommandExecutionRequestApprovalResponse,
     FileChangeRequestApprovalParams,
@@ -121,6 +123,7 @@ export interface ApprovalHandler {
 }
 
 export interface ElicitationHandler {
+    prepareRequest?(params: McpServerElicitationRequestParams): void;
     handleElicitation(params: McpServerElicitationRequestParams): Promise<McpServerElicitationRequestResponse>;
     handleUserInput(params: ToolRequestUserInputParams): Promise<ToolRequestUserInputResponse>;
 }
@@ -179,7 +182,14 @@ export class CodexAppServerClient {
     private elicitationHandlers = new Map<string, ElicitationHandler>();
     readonly mcpStartup = new McpStartupTracker();
     readonly mcpOauthCompletions = new McpOauthCompletions();
-    private readonly pendingTurnCompletionResolvers = new Map<string, Map<string, (event: TurnCompletedNotification) => void>>();
+    private readonly approvalHandlerWaiters = new Map<string, Set<HandlerWaiter<ApprovalHandler>>>();
+    private readonly elicitationHandlerWaiters = new Map<string, Set<HandlerWaiter<ElicitationHandler>>>();
+    private readonly activeServerRequestIds = new Set<RequestId>();
+    private readonly resolvedServerRequestIds = new Set<RequestId>();
+    private readonly serverRequestResolutionWaiters = new Map<RequestId, Set<() => void>>();
+    private readonly pendingNotifications = new Map<string, ServerNotification[]>();
+    private readonly pendingTurnCompletionResolvers = new Map<string, Map<string, Set<PromiseWaiter<TurnCompletedNotification>>>>();
+    private readonly completedTurns = new Map<string, Map<string, TurnCompletedNotification>>();
     private readonly pendingCompactionCompletionResolvers = new Map<string, Set<(event: CompactionCompletedNotification) => void>>();
     private readonly turnCompletionCaptures = new Map<string, Set<(event: TurnCompletedNotification) => void>>();
     private readonly turnRoutingCaptures = new Map<string, Set<(turnId: string, notification: ServerNotification) => void>>();
@@ -194,6 +204,7 @@ export class CodexAppServerClient {
     readonly connectionLoss: ConnectionLoss;
     /** The `$CODEX_HOME` of the app-server, for the error explanations. */
     private codexHome: string | null = null;
+    private connectionClosedError: Error | null = null;
 
     constructor(connection: MessageConnection) {
         this.connection = connection;
@@ -234,6 +245,12 @@ export class CodexAppServerClient {
             if (serverNotification.method === "thread/settings/updated") {
                 this.threadSettings.set(serverNotification.params.threadId, serverNotification.params.threadSettings);
             }
+            if (serverNotification.method === "serverRequest/resolved") {
+                this.recordServerRequestResolved(
+                    serverNotification.params.threadId,
+                    serverNotification.params.requestId,
+                );
+            }
             const routing = extractTurnRouting(serverNotification);
             if (this.handleStaleTurnNotification(serverNotification, routing)) {
                 return;
@@ -249,67 +266,138 @@ export class CodexAppServerClient {
         });
 
         this.connection.onRequest(CommandExecutionApprovalRequest, async (params) => {
-            if (this.isStaleTurn(params.threadId, params.turnId)) {
-                return { decision: "cancel" };
+            const requestId = getAppServerRequestId(params);
+            this.trackServerRequest(requestId);
+            try {
+                if (this.isStaleTurn(params.threadId, params.turnId)) {
+                    return { decision: "cancel" };
+                }
+                const handler = this.approvalHandlers.get(params.threadId)
+                    ?? await this.waitForApprovalHandler(params.threadId, params);
+                if (!handler || this.isServerRequestResolved(params)) {
+                    return { decision: "cancel" };
+                }
+                return await handler.handleCommandExecution(params);
+            } finally {
+                this.releaseServerRequest(requestId);
             }
-            const handler = this.approvalHandlers.get(params.threadId);
-            if (!handler) {
-                return { decision: "cancel" };
-            }
-            return await handler.handleCommandExecution(params);
         });
 
         this.connection.onRequest(FileChangeApprovalRequest, async (params) => {
-            if (this.isStaleTurn(params.threadId, params.turnId)) {
-                return { decision: "cancel" };
+            const requestId = getAppServerRequestId(params);
+            this.trackServerRequest(requestId);
+            try {
+                if (this.isStaleTurn(params.threadId, params.turnId)) {
+                    return { decision: "cancel" };
+                }
+                const handler = this.approvalHandlers.get(params.threadId)
+                    ?? await this.waitForApprovalHandler(params.threadId, params);
+                if (!handler || this.isServerRequestResolved(params)) {
+                    return { decision: "cancel" };
+                }
+                return await handler.handleFileChange(params);
+            } finally {
+                this.releaseServerRequest(requestId);
             }
-            const handler = this.approvalHandlers.get(params.threadId);
-            if (!handler) {
-                return { decision: "cancel" };
-            }
-            return await handler.handleFileChange(params);
         });
 
         this.connection.onRequest(PermissionsApprovalRequest, async (params) => {
-            if (this.isStaleTurn(params.threadId, params.turnId)) {
-                return { permissions: {}, scope: "turn", strictAutoReview: false };
+            const requestId = getAppServerRequestId(params);
+            this.trackServerRequest(requestId);
+            try {
+                if (this.isStaleTurn(params.threadId, params.turnId)) {
+                    return { permissions: {}, scope: "turn", strictAutoReview: false };
+                }
+                const handler = this.approvalHandlers.get(params.threadId)
+                    ?? await this.waitForApprovalHandler(params.threadId, params);
+                if (!handler || this.isServerRequestResolved(params)) {
+                    return { permissions: {}, scope: "turn", strictAutoReview: false };
+                }
+                return await handler.handlePermissionsRequest(params);
+            } finally {
+                this.releaseServerRequest(requestId);
             }
-            const handler = this.approvalHandlers.get(params.threadId);
-            if (!handler) {
-                return { permissions: {}, scope: "turn", strictAutoReview: false };
-            }
-            return await handler.handlePermissionsRequest(params);
         });
 
         this.connection.onRequest(McpServerElicitationRequest, async (params) => {
-            if (this.isStaleTurn(params.threadId, params.turnId)) {
-                return { action: "cancel", content: null, _meta: null };
+            const requestId = getAppServerRequestId(params);
+            this.trackServerRequest(requestId);
+            try {
+                if (this.isStaleTurn(params.threadId, params.turnId)) {
+                    return { action: "cancel", content: null, _meta: null };
+                }
+                const handler = this.elicitationHandlers.get(params.threadId)
+                    ?? await this.waitForElicitationHandler(params.threadId, params);
+                if (!handler || this.isServerRequestResolved(params)) {
+                    return { action: "cancel", content: null, _meta: null };
+                }
+                return await handler.handleElicitation(params);
+            } finally {
+                this.releaseServerRequest(requestId);
             }
-            const handler = this.elicitationHandlers.get(params.threadId);
-            if (!handler) {
-                return { action: "cancel", content: null, _meta: null };
-            }
-            return await handler.handleElicitation(params);
         });
 
         this.connection.onRequest(ToolRequestUserInputRequest, async (params) => {
-            if (this.isStaleTurn(params.threadId, params.turnId)) {
-                return { answers: {} };
+            const requestId = getAppServerRequestId(params);
+            this.trackServerRequest(requestId);
+            try {
+                if (this.isStaleTurn(params.threadId, params.turnId)) {
+                    return { answers: {} };
+                }
+                const handler = this.elicitationHandlers.get(params.threadId)
+                    ?? await this.waitForElicitationHandler(params.threadId, params);
+                if (!handler || this.isServerRequestResolved(params)) {
+                    return { answers: {} };
+                }
+                return await handler.handleUserInput(params);
+            } finally {
+                this.releaseServerRequest(requestId);
             }
-            const handler = this.elicitationHandlers.get(params.threadId);
-            if (!handler) {
-                return { answers: {} };
-            }
-            return await handler.handleUserInput(params);
         });
+
+        this.connection.onRequest(async (method, params) => {
+            const requestId = getAppServerRequestId(params);
+            if (requestId === null) {
+                return null;
+            }
+            this.trackServerRequest(requestId);
+            try {
+                await this.waitForServerRequestResolution(requestId);
+                return unresolvedServerRequestFallback(method);
+            } finally {
+                this.releaseServerRequest(requestId);
+            }
+        });
+        this.connection.onClose?.(() => this.handleConnectionClosed());
+        this.connection.onDispose?.(() => this.handleConnectionClosed());
     }
 
     onApprovalRequest(threadId: string, handler: ApprovalHandler): void {
         this.approvalHandlers.set(threadId, handler);
+        this.resolveWaiters(this.approvalHandlerWaiters, threadId, handler);
     }
 
     onElicitationRequest(threadId: string, handler: ElicitationHandler): void {
         this.elicitationHandlers.set(threadId, handler);
+        this.resolveWaiters(this.elicitationHandlerWaiters, threadId, handler);
+    }
+
+    isServerRequestResolved(params: object): boolean {
+        const requestId = getAppServerRequestId(params);
+        return requestId !== null && this.resolvedServerRequestIds.has(requestId);
+    }
+
+    private releaseServerRequest(requestId: RequestId | null): void {
+        if (requestId !== null) {
+            this.activeServerRequestIds.delete(requestId);
+            this.resolvedServerRequestIds.delete(requestId);
+        }
+    }
+
+    private trackServerRequest(requestId: RequestId | null): void {
+        if (requestId !== null) {
+            this.activeServerRequestIds.add(requestId);
+        }
     }
 
     clearThreadHandlers(threadId: string): void {
@@ -317,12 +405,20 @@ export class CodexAppServerClient {
         this.approvalHandlers.delete(threadId);
         this.elicitationHandlers.delete(threadId);
         this.threadSettings.delete(threadId);
+        this.pendingNotifications.delete(threadId);
+        this.staleTurnIds.delete(threadId);
+        this.completedTurns.delete(threadId);
+        this.resolveAllHandlerWaiters(threadId);
     }
 
     async initialize(params: InitializeParams): Promise<InitializeResponse> {
         const response: InitializeResponse = await this.sendRequest({ method: "initialize", params: params });
         this.codexHome = response?.codexHome ?? null;
         return response;
+    }
+
+    initialized(): void {
+        this.connection.sendNotification("initialized");
     }
 
     async turnStart(params: ExperimentalTurnStartParams): Promise<TurnStartResponse> {
@@ -346,6 +442,26 @@ export class CodexAppServerClient {
             // Wait for turn completion
             // If turnInterrupt() was called, Codex will send turn/completed event with status "interrupted"
             return await this.awaitTurnCompleted(params.threadId, turnStarted.turn.id);
+        } finally {
+            releaseCapture();
+        }
+    }
+
+    async runSteer(params: TurnSteerParams, onTurnStarted?: (turnId: string) => void): Promise<TurnCompletedNotification> {
+        const capturedCompletions: Array<TurnCompletedNotification> = [];
+        const releaseCapture = this.captureTurnCompletions(params.threadId, (event) => {
+            capturedCompletions.push(event);
+        });
+
+        try {
+            const response = await this.turnSteer(params);
+            onTurnStarted?.(response.turnId);
+            const earlyCompletion = capturedCompletions.find(event => event.turn.id === response.turnId);
+            releaseCapture();
+            if (earlyCompletion) {
+                return earlyCompletion;
+            }
+            return await this.awaitTurnCompleted(params.threadId, response.turnId);
         } finally {
             releaseCapture();
         }
@@ -916,21 +1032,28 @@ export class CodexAppServerClient {
         return await this.sendRequest({ method: "account/rateLimits/read", params: undefined });
     }
 
-    //TODO create type-safe helper
     async awaitTurnCompleted(threadId: string, turnId: string): Promise<TurnCompletedNotification> {
-        let resolver: ((event: TurnCompletedNotification) => void) | undefined;
-        const completed = new Promise<TurnCompletedNotification>((resolve) => {
-            resolver = resolve;
+        if (this.connectionLoss.lost) throw new AppServerConnectionLostError("the end of the turn");
+        const cached = this.completedTurns.get(threadId)?.get(turnId);
+        if (cached) {
+            this.completedTurns.get(threadId)!.delete(turnId);
+            if (this.completedTurns.get(threadId)!.size === 0) this.completedTurns.delete(threadId);
+            return cached;
+        }
+        let waiter!: PromiseWaiter<TurnCompletedNotification>;
+        const completed = new Promise<TurnCompletedNotification>((resolve, reject) => {
+            waiter = {resolve, reject};
             const threadResolvers = this.getOrCreatePendingTurnCompletionResolvers(threadId);
-            threadResolvers.set(turnId, resolve);
+            const turnResolvers = threadResolvers.get(turnId) ?? new Set();
+            turnResolvers.add(waiter);
+            threadResolvers.set(turnId, turnResolvers);
         });
         return await this.waitWhileConnected("the end of the turn", completed, () => {
             const threadResolvers = this.pendingTurnCompletionResolvers.get(threadId);
-            if (!threadResolvers || threadResolvers.get(turnId) !== resolver) return;
-            threadResolvers.delete(turnId);
-            if (threadResolvers.size === 0) {
-                this.pendingTurnCompletionResolvers.delete(threadId);
-            }
+            const turnResolvers = threadResolvers?.get(turnId);
+            turnResolvers?.delete(waiter);
+            if (turnResolvers?.size === 0) threadResolvers!.delete(turnId);
+            if (threadResolvers?.size === 0) this.pendingTurnCompletionResolvers.delete(threadId);
         });
     }
 
@@ -1010,6 +1133,14 @@ export class CodexAppServerClient {
      */
     onServerNotification(sessionId: string, callback: (event: ServerNotification) => void) {
         this.notificationHandlers.set(sessionId, callback);
+        const pending = this.pendingNotifications.get(sessionId);
+        if (!pending) {
+            return;
+        }
+        this.pendingNotifications.delete(sessionId);
+        for (const notification of pending) {
+            callback(notification);
+        }
     }
 
     private codexEventHandlers: Array<(event: CodexConnectionEvent) => void> = [];
@@ -1028,6 +1159,16 @@ export class CodexAppServerClient {
             const handler = this.notificationHandlers.get(threadId);
             if (handler) {
                 handler(notification);
+            } else {
+                const pending = this.pendingNotifications.get(threadId) ?? [];
+                pending.push(notification);
+                this.pendingNotifications.set(threadId, pending);
+            }
+            return;
+        }
+        if (!isGlobalNotification(notification)) {
+            if (isSafelySingletonRoutableNotification(notification) && this.notificationHandlers.size === 1) {
+                this.notificationHandlers.values().next().value?.(notification);
             }
             return;
         }
@@ -1068,25 +1209,173 @@ export class CodexAppServerClient {
 
     runningTurnId(threadId: string): string | undefined { return this.runningTurnIds.get(threadId); }
 
+    private waitForApprovalHandler(threadId: string, params: object): Promise<ApprovalHandler | null> {
+        return this.waitForHandler(this.approvalHandlerWaiters, threadId, getAppServerRequestId(params));
+    }
+
+    private waitForElicitationHandler(threadId: string, params: object): Promise<ElicitationHandler | null> {
+        return this.waitForHandler(this.elicitationHandlerWaiters, threadId, getAppServerRequestId(params));
+    }
+
+    private waitForHandler<T>(
+        waiters: Map<string, Set<HandlerWaiter<T>>>,
+        threadId: string,
+        requestId: RequestId | null,
+    ): Promise<T | null> {
+        if (this.connectionClosedError || (requestId !== null && this.resolvedServerRequestIds.has(requestId))) {
+            return Promise.resolve(null);
+        }
+        return new Promise((resolve) => {
+            const threadWaiters = waiters.get(threadId) ?? new Set();
+            threadWaiters.add({requestId, resolve});
+            waiters.set(threadId, threadWaiters);
+        });
+    }
+
+    private recordServerRequestResolved(threadId: string, requestId: RequestId): void {
+        if (this.activeServerRequestIds.has(requestId)) {
+            this.resolvedServerRequestIds.add(requestId);
+        }
+        const resolutionWaiters = this.serverRequestResolutionWaiters.get(requestId);
+        if (resolutionWaiters) {
+            this.serverRequestResolutionWaiters.delete(requestId);
+            for (const resolve of resolutionWaiters) {
+                resolve();
+            }
+        }
+        this.resolveRequestWaiters(this.approvalHandlerWaiters, threadId, requestId);
+        this.resolveRequestWaiters(this.elicitationHandlerWaiters, threadId, requestId);
+    }
+
+    private waitForServerRequestResolution(requestId: RequestId): Promise<void> {
+        if (this.connectionClosedError || this.resolvedServerRequestIds.has(requestId)) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+            const waiters = this.serverRequestResolutionWaiters.get(requestId) ?? new Set();
+            waiters.add(resolve);
+            this.serverRequestResolutionWaiters.set(requestId, waiters);
+        });
+    }
+
+    private resolveWaiters<T>(
+        waiters: Map<string, Set<HandlerWaiter<T>>>,
+        threadId: string,
+        handler: T,
+    ): void {
+        const threadWaiters = waiters.get(threadId);
+        if (!threadWaiters) {
+            return;
+        }
+        waiters.delete(threadId);
+        for (const waiter of threadWaiters) {
+            waiter.resolve(handler);
+        }
+    }
+
+    private resolveRequestWaiters<T>(
+        waiters: Map<string, Set<HandlerWaiter<T>>>,
+        threadId: string,
+        requestId: RequestId,
+    ): void {
+        const threadWaiters = waiters.get(threadId);
+        if (!threadWaiters) {
+            return;
+        }
+        for (const waiter of Array.from(threadWaiters)) {
+            if (waiter.requestId !== requestId) {
+                continue;
+            }
+            threadWaiters.delete(waiter);
+            waiter.resolve(null);
+        }
+        if (threadWaiters.size === 0) {
+            waiters.delete(threadId);
+        }
+    }
+
+    private resolveAllHandlerWaiters(threadId: string): void {
+        this.resolveAllWaiters(this.approvalHandlerWaiters, threadId);
+        this.resolveAllWaiters(this.elicitationHandlerWaiters, threadId);
+    }
+
+    private resolveAllWaiters<T>(waiters: Map<string, Set<HandlerWaiter<T>>>, threadId: string): void {
+        const threadWaiters = waiters.get(threadId);
+        if (!threadWaiters) {
+            return;
+        }
+        waiters.delete(threadId);
+        for (const waiter of threadWaiters) {
+            waiter.resolve(null);
+        }
+    }
+
+    private handleConnectionClosed(): void {
+        if (this.connectionClosedError) {
+            return;
+        }
+        const error = new Error("Codex app-server connection closed");
+        this.connectionClosedError = error;
+        for (const threadWaiters of this.approvalHandlerWaiters.values()) {
+            for (const waiter of threadWaiters) waiter.resolve(null);
+        }
+        for (const threadWaiters of this.elicitationHandlerWaiters.values()) {
+            for (const waiter of threadWaiters) waiter.resolve(null);
+        }
+        this.approvalHandlerWaiters.clear();
+        this.elicitationHandlerWaiters.clear();
+        this.activeServerRequestIds.clear();
+        this.resolvedServerRequestIds.clear();
+
+        for (const threadWaiters of this.pendingTurnCompletionResolvers.values()) {
+            for (const turnWaiters of threadWaiters.values()) {
+                for (const waiter of turnWaiters) waiter.reject(error);
+            }
+        }
+        this.pendingTurnCompletionResolvers.clear();
+        this.pendingCompactionCompletionResolvers.clear();
+
+        for (const waiters of this.serverRequestResolutionWaiters.values()) {
+            for (const resolve of waiters) resolve();
+        }
+        this.serverRequestResolutionWaiters.clear();
+        this.pendingNotifications.clear();
+        this.completedTurns.clear();
+        // vscode-jsonrpc emits onClose without rejecting pending RPC responses.
+        // Disposal releases those requests; onDispose alone does not emit onClose.
+        this.connection.dispose();
+    }
+
     private recordTurnCompleted(event: TurnCompletedNotification): void {
         const threadResolvers = this.pendingTurnCompletionResolvers.get(event.threadId);
-        const resolve = threadResolvers?.get(event.turn.id);
-        if (resolve) {
+        const resolvers = threadResolvers?.get(event.turn.id);
+        if (resolvers) {
             threadResolvers!.delete(event.turn.id);
             if (threadResolvers!.size === 0) {
                 this.pendingTurnCompletionResolvers.delete(event.threadId);
             }
-            resolve(event);
-            return;
+            for (const waiter of resolvers) {
+                waiter.resolve(event);
+            }
         }
 
         const captures = this.turnCompletionCaptures.get(event.threadId);
-        if (!captures) {
+        if (captures) {
+            for (const capture of captures) {
+                capture(event);
+            }
             return;
         }
-        for (const capture of captures) {
-            capture(event);
+        if (resolvers) {
+            return;
         }
+
+        const completed = this.completedTurns.get(event.threadId) ?? new Map();
+        completed.set(event.turn.id, event);
+        while (completed.size > 32) {
+            completed.delete(completed.keys().next().value!);
+        }
+        this.completedTurns.set(event.threadId, completed);
     }
 
     private recordCompactionCompleted(event: CompactionCompletedNotification): void {
@@ -1201,12 +1490,12 @@ export class CodexAppServerClient {
         }
     }
 
-    private getOrCreatePendingTurnCompletionResolvers(threadId: string): Map<string, (event: TurnCompletedNotification) => void> {
+    private getOrCreatePendingTurnCompletionResolvers(threadId: string): Map<string, Set<PromiseWaiter<TurnCompletedNotification>>> {
         const existing = this.pendingTurnCompletionResolvers.get(threadId);
         if (existing) {
             return existing;
         }
-        const created = new Map<string, (event: TurnCompletedNotification) => void>();
+        const created = new Map<string, Set<PromiseWaiter<TurnCompletedNotification>>>();
         this.pendingTurnCompletionResolvers.set(threadId, created);
         return created;
     }
@@ -1431,6 +1720,16 @@ export type ThreadSampleResponse = {
     outputTokens: number | null;
 };
 
+type PromiseWaiter<T> = {
+    resolve: (value: T) => void;
+    reject: (error: Error) => void;
+};
+
+type HandlerWaiter<T> = {
+    requestId: RequestId | null;
+    resolve: (handler: T | null) => void;
+};
+
 function isMcpServerStatusUpdatedNotification(notification: ServerNotification): notification is {
     method: "mcpServer/startupStatus/updated";
     params: McpServerStatusUpdatedNotification;
@@ -1482,11 +1781,113 @@ function goalsMatch(left: ThreadGoal, right: ThreadGoal): boolean {
 }
 
 function extractThreadId(notification: ServerNotification): string | null {
+    if (notification.method === "thread/started") {
+        return notification.params.thread.id;
+    }
     const params = notification.params as { threadId?: unknown } | undefined;
     if (params && typeof params.threadId === "string") {
         return params.threadId;
     }
     return null;
+}
+
+function isGlobalNotification(notification: ServerNotification): boolean {
+    switch (notification.method) {
+        case "account/gatewayOAuth/changed":
+        case "account/rateLimits/updated":
+        case "configWarning":
+        case "deprecationNotice":
+        case "guardianWarning":
+        case "remoteControl/status/changed":
+        case "skills/changed":
+        case "warning":
+        case "windows/worldWritableWarning":
+        case "windowsSandbox/setupCompleted":
+            return true;
+        case "error":
+        case "thread/attachment/updated":
+        case "thread/started":
+        case "thread/status/changed":
+        case "thread/readState/changed":
+        case "thread/archived":
+        case "thread/deleted":
+        case "thread/unarchived":
+        case "thread/closed":
+        case "thread/reverted":
+        case "thread/name/updated":
+        case "thread/goal/updated":
+        case "thread/prediction/updated":
+        case "thread/goal/cleared":
+        case "thread/queue/changed":
+        case "project/changed":
+        case "thread/project/updated":
+        case "thread/environment/connected":
+        case "thread/environment/disconnected":
+        case "thread/settings/updated":
+        case "thread/tokenUsage/updated":
+        case "turn/started":
+        case "hook/started":
+        case "turn/completed":
+        case "hook/completed":
+        case "turn/diff/updated":
+        case "turn/plan/updated":
+        case "item/started":
+        case "item/autoApprovalReview/started":
+        case "item/autoApprovalReview/completed":
+        case "autoApprovalReview/strictReviewRequired":
+        case "item/completed":
+        case "rawResponseItem/completed":
+        case "rawResponse/completed":
+        case "item/agentMessage/delta":
+        case "item/plan/delta":
+        case "command/exec/outputDelta":
+        case "process/outputDelta":
+        case "process/exited":
+        case "item/commandExecution/outputDelta":
+        case "item/commandExecution/terminalInteraction":
+        case "item/fileChange/outputDelta":
+        case "item/fileChange/patchUpdated":
+        case "serverRequest/resolved":
+        case "item/mcpToolCall/progress":
+        case "mcpServer/oauthLogin/completed":
+        case "mcpServer/startupStatus/updated":
+        case "mcpServer/event/stream/notification":
+        case "account/updated":
+        case "app/list/updated":
+        case "externalAgentConfig/import/progress":
+        case "externalAgentConfig/import/completed":
+        case "fs/changed":
+        case "item/reasoning/summaryTextDelta":
+        case "item/reasoning/summaryPartAdded":
+        case "item/reasoning/textDelta":
+        case "thread/compacted":
+        case "model/rerouted":
+        case "model/verification":
+        case "modelProvider/authRecoveryStarted":
+        case "modelProvider/authRecoveryCompleted":
+        case "turn/moderationMetadata":
+        case "model/safetyBuffering/updated":
+        case "fuzzyFileSearch/sessionUpdated":
+        case "fuzzyFileSearch/sessionCompleted":
+        case "thread/realtime/started":
+        case "thread/realtime/itemAdded":
+        case "thread/realtime/item/started":
+        case "thread/realtime/item/transcript/delta":
+        case "thread/realtime/item/completed":
+        case "thread/realtime/transcript/delta":
+        case "thread/realtime/transcript/done":
+        case "thread/realtime/outputAudio/delta":
+        case "thread/realtime/sdp":
+        case "thread/realtime/error":
+        case "thread/realtime/closed":
+        case "account/login/completed":
+            return false;
+    }
+}
+
+function isSafelySingletonRoutableNotification(notification: ServerNotification): boolean {
+    return notification.method === "fuzzyFileSearch/sessionUpdated"
+        || notification.method === "fuzzyFileSearch/sessionCompleted";
 }
 
 function extractTurnRouting(notification: ServerNotification): { threadId: string | null, turnId: string | null } {
@@ -1556,5 +1957,20 @@ async function withHistoryTimeout<T>(page: Promise<T>, method: string, threadId:
         return await Promise.race([page, timeout]);
     } finally {
         clearTimeout(timer);
+    }
+}
+
+function unresolvedServerRequestFallback(method: string): unknown {
+    switch (method) {
+        case "item/tool/call":
+            return {contentItems: [], success: false};
+        case "applyPatchApproval":
+        case "execCommandApproval":
+            return {decision: "abort"};
+        case "account/chatgptAuthTokens/refresh":
+        case "attestation/generate":
+            return null;
+        default:
+            return null;
     }
 }

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {describe, expect, it, vi} from "vitest";
-import {startCodexConnection} from "../../CodexJsonRpcConnection";
+import {startCodexConnection, startStdioCodexConnection} from "../../CodexJsonRpcConnection";
 import {CodexAppServerSupervisor, type SupervisedProcessState} from "../../app-server-recovery/CodexAppServerSupervisor";
 import {describeExit} from "../../app-server-recovery/AppServerExit";
 import {fakeAppServer, fakeSpawner} from "./fake-app-server";
@@ -44,7 +44,7 @@ describe("CodexAppServerSupervisor", () => {
 process.stdout.write(JSON.stringify({method: "turn/completed", params: {threadId: "t", turn: {id: "u"}}}) + "\\n", () => process.exit(1));
 `);
         fs.chmodSync(script, 0o755);
-        const state = {connection: startCodexConnection(script, undefined, undefined, {disposeOnExit: false}), codexPath: script, stderr: ""};
+        const state = {connection: startStdioCodexConnection(script, undefined, undefined, {disposeOnExit: false}), codexPath: script, stderr: ""};
         const received: string[] = [];
         state.connection.connection.onUnhandledNotification((notification) => {
             received.push(notification.method);
@@ -63,6 +63,73 @@ process.stdout.write(JSON.stringify({method: "turn/completed", params: {threadId
         fs.rmSync(dir, {recursive: true, force: true});
     }, 15_000);
 
+    it.skipIf(process.platform === "win32")("drains the last WebSocket notification before stopping a proxy", async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-drain-"));
+        const script = path.join(dir, "codex");
+        fs.writeFileSync(script, `#!/usr/bin/env node
+if (process.argv[2] === "remote-control") process.exit(0);
+const crypto = require("node:crypto");
+const frame = method => {
+    const payload = Buffer.from(JSON.stringify({method}));
+    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+};
+let handshake = "";
+process.stdin.on("data", chunk => {
+    handshake += chunk.toString();
+    if (!handshake.includes("\\r\\n\\r\\n")) return;
+    const key = /Sec-WebSocket-Key: (.+)/i.exec(handshake)[1].trim();
+    const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    process.stdout.write("HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Accept: " + accept + "\\r\\n\\r\\n");
+    process.stdout.write(frame("test/ready"));
+});
+process.stdin.once("end", () => process.stdout.write(frame("test/last"), () => process.exit(0)));
+`);
+        fs.chmodSync(script, 0o755);
+        const connection = startCodexConnection(script, undefined, undefined, {disposeOnExit: false});
+        const supervisor = new CodexAppServerSupervisor({connection, codexPath: script, stderr: ""});
+        const received: string[] = [];
+        let ready!: () => void;
+        const started = new Promise<void>(resolve => { ready = resolve; });
+        connection.connection.onUnhandledNotification(notification => {
+            received.push(notification.method);
+            if (notification.method === "test/ready") ready();
+        });
+        try {
+            await started;
+
+            const exit = await supervisor.stop();
+
+            expect(exit.code).toBe(0);
+            expect(received).toEqual(["test/ready", "test/last"]);
+        } finally {
+            connection.process.kill();
+            fs.rmSync(dir, {recursive: true, force: true});
+        }
+    }, 2_000);
+
+    it.skipIf(process.platform === "win32")("finishes stopping after the connection was disposed before stdout ended", async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-disposed-"));
+        const script = path.join(dir, "codex");
+        fs.writeFileSync(script, `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.once("end", () => process.exit(0));
+`);
+        fs.chmodSync(script, 0o755);
+        const connection = startStdioCodexConnection(script, undefined, undefined, {disposeOnExit: false});
+        const supervisor = new CodexAppServerSupervisor({connection, codexPath: script, stderr: ""});
+        try {
+            connection.connection.dispose();
+
+            const exit = await supervisor.stop();
+
+            expect(exit.intentional).toBe(true);
+            expect(exit.code).toBe(0);
+        } finally {
+            connection.process.kill();
+            fs.rmSync(dir, {recursive: true, force: true});
+        }
+    }, 2_000);
+
     it.skipIf(process.platform === "win32")("delivers a burst of output written before the exit, up to its last message", async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-burst-"));
         const script = path.join(dir, "codex");
@@ -73,7 +140,7 @@ out += JSON.stringify({method: "turn/completed", params: {threadId: "t", turn: {
 process.stdout.write(out, () => process.exit(1));
 `);
         fs.chmodSync(script, 0o755);
-        const state = {connection: startCodexConnection(script, undefined, undefined, {disposeOnExit: false}), codexPath: script, stderr: ""};
+        const state = {connection: startStdioCodexConnection(script, undefined, undefined, {disposeOnExit: false}), codexPath: script, stderr: ""};
         let deltas = 0;
         let completedBeforeDispose = false;
         let disposed = false;
@@ -103,7 +170,7 @@ out += JSON.stringify({method: "turn/completed", params: {threadId: "t", turn: {
 process.stdout.write(out, () => process.exit(1));
 `);
         fs.chmodSync(script, 0o755);
-        const state = {connection: startCodexConnection(script, undefined, undefined, {disposeOnExit: false}), codexPath: script, stderr: ""};
+        const state = {connection: startStdioCodexConnection(script, undefined, undefined, {disposeOnExit: false}), codexPath: script, stderr: ""};
         let completed = false;
         state.connection.connection.onUnhandledNotification((notification) => {
             // About 1 ms of work per message: the backlog takes about 2 s, more than the close grace time.

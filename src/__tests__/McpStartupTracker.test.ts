@@ -3,7 +3,7 @@ import {tmpdir} from "node:os";
 import path from "node:path";
 import {afterEach, describe, expect, it} from "vitest";
 import {CodexAppServerClient} from "../CodexAppServerClient";
-import {startCodexConnection} from "../CodexJsonRpcConnection";
+import {startStdioCodexConnection} from "../CodexJsonRpcConnection";
 import {McpOauthCompletions} from "../mcp/McpOauthCompletions";
 import {McpStartupTracker} from "../mcp/McpStartupTracker";
 
@@ -41,7 +41,7 @@ describe("McpStartupTracker", () => {
         const fakeCodex = path.join(dir, "codex");
         writeFileSync(fakeCodex, "#!/bin/sh\nexec sleep 30\n");
         chmodSync(fakeCodex, 0o755);
-        const codex = startCodexConnection(fakeCodex);
+        const codex = startStdioCodexConnection(fakeCodex);
         const client = new CodexAppServerClient(codex.connection);
 
         const startup = client.mcpStartup.await(["fs"], client.mcpStartup.version(), {threadId: "thread-id"});

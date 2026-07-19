@@ -4,9 +4,11 @@
     {
       "sessionId": "test-session-id",
       "update": {
-        "sessionUpdate": "tool_call_update",
+        "sessionUpdate": "tool_call",
         "toolCallId": "dyn-tool-123",
         "name": "list_apps",
+        "kind": "execute",
+        "title": "list_apps",
         "status": "completed",
         "content": [
           {
@@ -16,7 +18,12 @@
               "text": "Done"
             }
           }
-        ]
+        ],
+        "rawInput": {
+          "arguments": {
+            "includeDisabled": false
+          }
+        }
       }
     }
   ]

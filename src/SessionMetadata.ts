@@ -1,14 +1,25 @@
 import type {ModeKind} from "./app-server/ModeKind";
+import type {Personality} from "./app-server/Personality";
+import type {ReasoningSummary} from "./app-server/ReasoningSummary";
 import type {
     ApprovalsReviewer,
     AskForApproval,
     Model,
     PermissionProfileSummary,
+    SandboxPolicy,
     Thread,
     ThreadItemEntry,
     ThreadStatus,
 } from "./app-server/v2";
 import type {SessionInstructions} from "./ClientSystemPrompt";
+export type PreservedTurnSettings = {
+    approvalPolicy: AskForApproval,
+    approvalsReviewer: ApprovalsReviewer,
+    sandboxPolicy: SandboxPolicy,
+    preservePermissionProfile: boolean,
+    summary?: ReasoningSummary | null,
+    personality?: Personality | null,
+}
 
 export type SessionMetadata = {
     sessionId: string,
@@ -26,6 +37,10 @@ export type SessionMetadata = {
     approvalPolicy?: AskForApproval,
     approvalsReviewer?: ApprovalsReviewer,
     permissionProfiles?: PermissionProfileSummary[],
+    cwd?: string,
+    turnSettings?: PreservedTurnSettings,
+    activeTurnId?: string | null,
+    threadSnapshot?: Thread,
 }
 
 export type SessionMetadataWithThread = SessionMetadata & {

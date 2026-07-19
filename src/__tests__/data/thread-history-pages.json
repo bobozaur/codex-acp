@@ -1,0 +1,95 @@
+{
+  "turns": [
+    {
+      "id": "turn-1",
+      "rootTurnId": null,
+      "items": [
+        {
+          "type": "agentMessage",
+          "id": "same-id",
+          "text": "Same text",
+          "phase": null,
+          "memoryCitation": null,
+          "delivery": null,
+          "questions": null
+        },
+        {
+          "type": "agentMessage",
+          "id": "last",
+          "text": "Last",
+          "phase": null,
+          "memoryCitation": null,
+          "delivery": null,
+          "questions": null
+        }
+      ],
+      "itemsView": "full",
+      "status": "completed",
+      "error": null,
+      "startedAt": null,
+      "completedAt": null,
+      "durationMs": null
+    },
+    {
+      "id": "turn-2",
+      "rootTurnId": null,
+      "items": [
+        {
+          "type": "agentMessage",
+          "id": "same-id",
+          "text": "Same text",
+          "phase": null,
+          "memoryCitation": null,
+          "delivery": null,
+          "questions": null
+        }
+      ],
+      "itemsView": "full",
+      "status": "completed",
+      "error": null,
+      "startedAt": null,
+      "completedAt": null,
+      "durationMs": null
+    }
+  ],
+  "requests": {
+    "turns": [
+      [
+        {
+          "threadId": "history-thread",
+          "cursor": "resume-turn",
+          "limit": 100,
+          "sortDirection": "desc",
+          "itemsView": "notLoaded"
+        }
+      ],
+      [
+        {
+          "threadId": "history-thread",
+          "cursor": "older-turns",
+          "limit": 100,
+          "sortDirection": "desc",
+          "itemsView": "notLoaded"
+        }
+      ]
+    ],
+    "items": [
+      [
+        {
+          "threadId": "history-thread",
+          "cursor": "resume-item",
+          "limit": 100,
+          "sortDirection": "desc"
+        }
+      ],
+      [
+        {
+          "threadId": "history-thread",
+          "cursor": "older-items",
+          "limit": 100,
+          "sortDirection": "desc"
+        }
+      ]
+    ]
+  }
+}

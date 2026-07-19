@@ -33,14 +33,22 @@ import {subagentInteractionSignal, withSubagentUserAction} from "../subagents/Su
 import {CommandReporter} from "../tool-calls/reporters/CommandReporter";
 import {FileChangeReporter} from "../tool-calls/reporters/FileChangeReporter";
 import {SandboxPermissionReporter} from "../tool-calls/reporters/SandboxPermissionReporter";
+import type {RequestId} from "../app-server";
+import {getAppServerRequestId} from "../AppServerRequestContext";
 
 export class CodexApprovalHandler implements ApprovalHandler {
+    private cancellationSignal: AbortSignal | undefined;
+    private readonly pendingRequestControllers = new Set<AbortController>();
+    private readonly pendingRequestControllersById = new Map<RequestId, Set<AbortController>>();
+
     constructor(
         private readonly connection: AcpClientConnection,
         private readonly permissionContext: PermissionPromptContext,
-        private readonly cancellationSignal: AbortSignal | undefined,
+        cancellationSignal: AbortSignal | undefined,
         private readonly renderer: AcpToolCallRenderer,
-    ) {}
+    ) {
+        this.cancellationSignal = cancellationSignal;
+    }
 
     async handleCommandExecution(
         params: CommandExecutionRequestApprovalParams,
@@ -53,7 +61,7 @@ export class CodexApprovalHandler implements ApprovalHandler {
         }
 
         try {
-            const response = await this.requestPermission({
+            const response = await this.requestPermission(params, {
                 sessionId: params.threadId,
                 toolCall: this.renderer.renderPermissionToolCall(CommandReporter.permission(
                     authoritativeParams,
@@ -77,7 +85,7 @@ export class CodexApprovalHandler implements ApprovalHandler {
     async handleFileChange(params: FileChangeRequestApprovalParams): Promise<FileChangeRequestApprovalResponse> {
         const decisions = fileChangeDecisionOptions();
         try {
-            const response = await this.requestPermission({
+            const response = await this.requestPermission(params, {
                 sessionId: params.threadId,
                 toolCall: this.renderer.renderPermissionToolCall(FileChangeReporter.permission(
                     params,
@@ -101,7 +109,7 @@ export class CodexApprovalHandler implements ApprovalHandler {
         params: PermissionsRequestApprovalParams,
     ): Promise<PermissionsRequestApprovalResponse> {
         try {
-            const response = await this.requestPermission({
+            const response = await this.requestPermission(params, {
                 sessionId: params.threadId,
                 toolCall: this.renderer.renderPermissionToolCall(SandboxPermissionReporter.permission(
                     params.itemId,
@@ -123,13 +131,74 @@ export class CodexApprovalHandler implements ApprovalHandler {
         }
     }
 
-    private requestPermission(request: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
-        const signal = subagentInteractionSignal(request.sessionId, this.cancellationSignal);
-        return withSubagentUserAction(request.sessionId, () => this.connection.request(
-            acp.methods.client.session.requestPermission,
-            request,
-            signal ? {cancellationSignal: signal} : undefined,
-        ), request.toolCall.toolCallId);
+    setCancellationSignal(signal?: AbortSignal): void {
+        this.cancellationSignal = signal;
+    }
+
+    cancelPendingRequests(): void {
+        for (const controller of this.pendingRequestControllers) {
+            controller.abort();
+        }
+        this.pendingRequestControllers.clear();
+        this.pendingRequestControllersById.clear();
+    }
+
+    cancelPendingRequest(requestId: RequestId): void {
+        const controllers = this.pendingRequestControllersById.get(requestId);
+        if (!controllers) return;
+        this.pendingRequestControllersById.delete(requestId);
+        for (const controller of controllers) {
+            this.pendingRequestControllers.delete(controller);
+            controller.abort();
+        }
+    }
+
+    private async requestPermission(
+        params: object,
+        request: acp.RequestPermissionRequest,
+    ): Promise<acp.RequestPermissionResponse> {
+        const pendingRequest = this.beginRequest(params, request.sessionId);
+        try {
+            return await withSubagentUserAction(request.sessionId, () => this.connection.request(
+                acp.methods.client.session.requestPermission,
+                request,
+                pendingRequest.options,
+            ), request.toolCall.toolCallId, pendingRequest.options.cancellationSignal);
+        } finally {
+            pendingRequest.dispose();
+        }
+    }
+
+    private beginRequest(params: object, sessionId: string): {options: acp.SendRequestOptions, dispose: () => void} {
+        const controller = new AbortController();
+        const requestId = getAppServerRequestId(params);
+        const cancellationSignal = subagentInteractionSignal(sessionId, this.cancellationSignal);
+        const abort = () => controller.abort();
+        if (cancellationSignal?.aborted) {
+            controller.abort();
+        } else {
+            cancellationSignal?.addEventListener("abort", abort, {once: true});
+        }
+        this.pendingRequestControllers.add(controller);
+        if (requestId !== null) {
+            const controllers = this.pendingRequestControllersById.get(requestId) ?? new Set();
+            controllers.add(controller);
+            this.pendingRequestControllersById.set(requestId, controllers);
+        }
+        return {
+            options: {cancellationSignal: controller.signal},
+            dispose: () => {
+                this.pendingRequestControllers.delete(controller);
+                if (requestId !== null) {
+                    const controllers = this.pendingRequestControllersById.get(requestId);
+                    controllers?.delete(controller);
+                    if (controllers?.size === 0) {
+                        this.pendingRequestControllersById.delete(requestId);
+                    }
+                }
+                cancellationSignal?.removeEventListener("abort", abort);
+            },
+        };
     }
 
     private selectedDecision<T>(response: acp.RequestPermissionResponse, decisions: DecisionOption<T>[]): T | undefined {

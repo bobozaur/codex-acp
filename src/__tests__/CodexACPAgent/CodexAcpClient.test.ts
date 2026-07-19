@@ -15,6 +15,7 @@ import {
 import type {ServerNotification} from "../../app-server";
 import type {SessionState} from "../../CodexAcpServer";
 import {AgentMode} from "../../AgentMode";
+import type {PreservedTurnSettings} from "../../SessionMetadata";
 import type {Model, ReviewStartResponse, ThreadGoal, TurnCompletedNotification, TurnStartParams} from "../../app-server/v2";
 import type {RateLimitsMap} from "../../RateLimitsMap";
 import {ModelId} from "../../ModelId";
@@ -34,7 +35,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         vi.unstubAllEnvs();
     });
 
-    const ignoredFields = ["thread", "cwd", "id", "createdAt", "path", "threadId", "userAgent", "sandbox",  "conversationId", "origins", "supportedReasoningEfforts", "reasoningEffort", "model", "readOnlyAccess", "approvalsReviewer"];
+    const ignoredFields = ["thread", "cwd", "id", "createdAt", "path", "threadId", "userAgent", "sandbox", "conversationId", "origins", "supportedReasoningEfforts", "reasoningEffort", "model", "readOnlyAccess", "approvalsReviewer", "clientUserMessageId"];
 
     it('should throw error without authentication', async () => {
         const authFixture = createTestFixture();
@@ -4368,6 +4369,100 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             ...overrides,
         };
     }
+
+    it.each([
+        {
+            scenario: "an explicitly selected permission profile",
+            mode: AgentMode.all([{id: "team", description: null, allowed: true}]).find(mode => mode.permissionProfileId === "team")!,
+            preserved: undefined,
+            expected: {
+                approvalPolicy: "on-request", approvalsReviewer: "user", permissions: "team",
+                runtimeWorkspaceRoots: ["/workspace", "/extra"], summary: "auto",
+            },
+        },
+        {
+            scenario: "a remotely selected permission profile",
+            mode: AgentMode.Agent,
+            preserved: {
+                approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: {type: "dangerFullAccess"},
+                preservePermissionProfile: true, summary: "detailed", personality: null,
+            } satisfies PreservedTurnSettings,
+            expected: {summary: "detailed", personality: null},
+        },
+        {
+            scenario: "remote legacy sandbox settings",
+            mode: AgentMode.Agent,
+            preserved: {
+                approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: {type: "readOnly", networkAccess: false},
+                preservePermissionProfile: false, summary: null, personality: null,
+            } satisfies PreservedTurnSettings,
+            expected: {
+                approvalPolicy: "never", approvalsReviewer: "user", sandboxPolicy: {type: "readOnly", networkAccess: false},
+                summary: null, personality: null,
+            },
+        },
+    ])("preserves $scenario when starting a turn", async ({mode, preserved, expected}) => {
+        const mock = createCodexMockTestFixture();
+        const raw = mock.getCodexAppServerClient();
+        vi.spyOn(raw, "listSkills").mockResolvedValue({data: []});
+        const runTurn = vi.spyOn(raw, "runTurn").mockResolvedValue(createReviewCompletedNotification());
+
+        await mock.getCodexAcpClient().sendPrompt(
+            {sessionId: "session-id", prompt: [{type: "text", text: "Continue"}]},
+            mode, ModelId.create("model", "medium"), null, false, "/workspace", ["/extra"],
+            undefined, undefined, null, "local-message", preserved,
+        );
+
+        const {threadId, input, model, effort, serviceTier, clientUserMessageId, ...settings} = runTurn.mock.calls[0]![0];
+        expect({threadId, input, model, effort, serviceTier, clientUserMessageId}).toEqual({
+            threadId: "session-id", input: [{type: "text", text: "Continue", text_elements: []}],
+            model: "model", effort: "medium", serviceTier: null, clientUserMessageId: "local-message",
+        });
+        expect(settings).toEqual(expected);
+    });
+
+    it.each([
+        new Error("no active turn to steer"),
+        Object.assign(new Error("Internal error"), {data: "no active turn to steer"}),
+        Object.assign(new Error("Internal error"), {data: {details: "no active turn to steer"}}),
+    ])("starts a new turn if active-turn steering races completion (%#)", async error => {
+        const mock = createCodexMockTestFixture();
+        const raw = mock.getCodexAppServerClient();
+        vi.spyOn(raw, "listSkills").mockResolvedValue({data: []});
+        const runSteer = vi.spyOn(raw, "runSteer").mockRejectedValue(error);
+        const runTurn = vi.spyOn(raw, "runTurn").mockResolvedValue(createReviewCompletedNotification());
+
+        await mock.getCodexAcpClient().sendPrompt(
+            {sessionId: "session-id", prompt: [{type: "text", text: "Continue"}]},
+            AgentMode.Agent, ModelId.create("model", "medium"), null, false, "/workspace", [],
+            undefined, undefined, "old-turn", "local-message",
+        );
+
+        expect(runSteer).toHaveBeenCalledWith(expect.objectContaining({
+            expectedTurnId: "old-turn", clientUserMessageId: "local-message",
+        }), undefined);
+        expect(runTurn).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+        new Error("expected active turn id `old-turn` but found `new-turn`"),
+        Object.assign(new Error("Internal error"), {data: {details: "expected active turn id old-turn but found new-turn"}}),
+    ])("retries a replaced active turn once without starting a competing turn (%#)", async error => {
+        const mock = createCodexMockTestFixture();
+        const raw = mock.getCodexAppServerClient();
+        vi.spyOn(raw, "listSkills").mockResolvedValue({data: []});
+        const runSteer = vi.spyOn(raw, "runSteer").mockRejectedValue(error);
+        const runTurn = vi.spyOn(raw, "runTurn");
+
+        await expect(mock.getCodexAcpClient().sendPrompt(
+            {sessionId: "session-id", prompt: [{type: "text", text: "Continue"}]},
+            AgentMode.Agent, ModelId.create("model", "medium"), null, false, "/workspace", [],
+            undefined, undefined, "old-turn", "local-message",
+        )).rejects.toBe(error);
+
+        expect(runSteer.mock.calls.map(([params]) => params.expectedTurnId)).toEqual(["old-turn", "new-turn"]);
+        expect(runTurn).not.toHaveBeenCalled();
+    });
 
     it ('should disable reasoning.summary if key authorization is used', async () => {
         const { mockFixture, turnStartSpy } = setupPromptFixture({ account: { type: "apiKey" } });

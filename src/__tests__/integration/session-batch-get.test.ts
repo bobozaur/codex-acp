@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {expect, it} from "vitest";
-import {startCodexConnection} from "../../CodexJsonRpcConnection";
+import {startStdioCodexConnection} from "../../CodexJsonRpcConnection";
 import {createBaseTestFixture, writeCodexHomeConfig} from "../acp-test-utils";
 import {describeIntegration} from "./integration-fixture";
 
@@ -39,7 +39,7 @@ describeIntegration("integration: session batch metadata", () => {
         for (let index = 0; index < 60; index++) {
             rollout(`00000000-0000-4000-8000-${(100 + index).toString(16).padStart(12, "0")}`, `Recent ${index}`, "2026-02-01T00:00:00");
         }
-        const codex = startCodexConnection(path.resolve("node_modules/.bin/codex"), {...process.env, CODEX_HOME: home});
+        const codex = startStdioCodexConnection(path.resolve("node_modules/.bin/codex"), {...process.env, CODEX_HOME: home});
         const fixture = createBaseTestFixture({connection: codex.connection, getExitCode: () => codex.process.exitCode});
         const index = fixture.getCodexAcpAgent().sessionIndex;
         try {

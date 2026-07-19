@@ -124,6 +124,31 @@ describe("CodexEventHandler - agent message events", () => {
         );
     });
 
+    it("recovers a completion suffix that finishes a streamed file citation", async () => {
+        const item = {
+            type: "agentMessage" as const,
+            id: "completed-citation",
+            text: "See :codex-file-citation{path=\"docs/policy.txt\"} for details.",
+            phase: "final_answer" as const,
+            memoryCitation: null,
+            delivery: null,
+            questions: null,
+        };
+        const notifications: ServerNotification[] = [
+            {method: "item/started", params: {threadId: sessionId, turnId: "turn-1", startedAtMs: 0, item: {...item, text: ""}}},
+            {method: "item/agentMessage/delta", params: {
+                threadId: sessionId, turnId: "turn-1", itemId: item.id, delta: "See :codex-file-cita",
+            }},
+            {method: "item/completed", params: {threadId: sessionId, turnId: "turn-1", completedAtMs: 0, item}},
+        ];
+
+        await setupPromptAndSendNotifications(mockFixture, sessionId, sessionState, notifications);
+
+        await expect(mockFixture.getAcpConnectionDump([])).toMatchFileSnapshot(
+            "data/agent-message-completed-citation.json"
+        );
+    });
+
     it("sends an agent message that arrives whole, without deltas", async () => {
         const item = {
             type: "agentMessage" as const,

@@ -1,6 +1,7 @@
 import {afterEach, describe, expect, it, vi} from "vitest";
 import * as acp from "@agentclientprotocol/sdk/unstable";
-import {createCodexMockTestFixture, createTestModel} from "../acp-test-utils";
+import {createCodexMockTestFixture, createTestModel, mockPromptTurn} from "../acp-test-utils";
+import type {PreservedTurnSettings} from "../../SessionMetadata";
 import {AgentMode, MODE_CONFIG_ID} from "../../AgentMode";
 import {
     MODEL_CONFIG_ID,
@@ -47,6 +48,8 @@ async function createSession(
         activePermissionProfileId?: string | null;
         approvalPolicy?: "on-request" | "never";
         approvalsReviewer?: "user" | "auto_review";
+        turnSettings?: PreservedTurnSettings;
+        resume?: boolean;
     } = {},
 ) {
     const {
@@ -56,14 +59,17 @@ async function createSession(
         activePermissionProfileId = null,
         approvalPolicy = "on-request",
         approvalsReviewer = "user",
+        turnSettings,
+        resume = false,
     } = options;
     const fixture = createCodexMockTestFixture();
     const codexAcpAgent = fixture.getCodexAcpAgent();
     const codexAcpClient = fixture.getCodexAcpClient();
 
+    vi.spyOn(fixture.getCodexAppServerClient(), "listSkills").mockResolvedValue({data: []});
     vi.spyOn(codexAcpClient, "readAuthRequirement").mockResolvedValue({required: false, account: null});
     vi.spyOn(codexAcpClient, "getAccount").mockResolvedValue({account: null, requiresOpenaiAuth: false});
-    vi.spyOn(codexAcpClient, "newSession").mockResolvedValue({
+    vi.spyOn(codexAcpClient, resume ? "resumeSession" : "newSession").mockResolvedValue({
         sessionId: "session-id",
         currentModelId,
         models: availableModels,
@@ -73,17 +79,21 @@ async function createSession(
         approvalPolicy,
         approvalsReviewer,
         permissionProfiles,
+        ...(turnSettings ? {turnSettings} : {}),
     });
 
     if (clientCapabilities) {
         await codexAcpAgent.initialize({protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities});
     }
 
-    const response = await codexAcpAgent.newSession({
+    const request = {
         cwd: "/test/cwd",
         mcpServers: [],
         _meta: {additionalRoots: additionalDirectories},
-    });
+    };
+    const response = resume
+        ? await codexAcpAgent.resumeSession({...request, sessionId: "session-id"})
+        : await codexAcpAgent.newSession(request);
     return {fixture, codexAcpAgent, codexAcpClient, response};
 }
 
@@ -357,7 +367,8 @@ describe("Session config options", () => {
         {selection: "INITIAL_AGENT_MODE", initialMode: "workspace-write", modeId: "workspace-write"},
         {selection: "session/set_mode", initialMode: "read-only", modeId: "workspace-write"},
         {selection: "session/set_config_option", initialMode: "read-only", modeId: "workspace-write"},
-    ])("applies $modeId permissions after $selection from $initialMode", async ({selection, initialMode, modeId}) => {
+    ].flatMap(testCase => (testCase.selection === "INITIAL_AGENT_MODE" ? [false, true] : [false])
+        .map(resume => ({...testCase, resume}))))("applies $modeId permissions after $selection from $initialMode (resume=$resume)", async ({selection, initialMode, modeId, resume}) => {
         vi.stubEnv("INITIAL_AGENT_MODE", initialMode);
         const {fast} = buildModels();
         const {fixture, codexAcpAgent, response} = await createSession("fast-model[medium]", [fast], {
@@ -366,14 +377,27 @@ describe("Session config options", () => {
                 terminal: false,
             },
             additionalDirectories: ["/test/extra"],
+            resume,
+            activePermissionProfileId: ":workspace",
+            turnSettings: {
+                approvalPolicy: "never",
+                approvalsReviewer: "user",
+                sandboxPolicy: {
+                    type: "workspaceWrite", writableRoots: [], networkAccess: true,
+                    excludeTmpdirEnvVar: false, excludeSlashTmp: false,
+                },
+                preservePermissionProfile: true,
+                summary: "detailed",
+                personality: null,
+            },
         });
         expect(response.modes?.currentModeId).toBe(initialMode);
 
         if (selection === "session/set_mode") {
-            await codexAcpAgent.setSessionMode({sessionId: response.sessionId, modeId});
+            await codexAcpAgent.setSessionMode({sessionId: "session-id", modeId});
         } else if (selection === "session/set_config_option") {
             const result = await codexAcpAgent.setSessionConfigOption({
-                sessionId: response.sessionId,
+                sessionId: "session-id",
                 configId: "mode",
                 value: modeId,
             });
@@ -388,12 +412,12 @@ describe("Session config options", () => {
         };
         const turnStart = vi.spyOn(appServer, "turnStart").mockResolvedValue({turn});
         vi.spyOn(appServer, "awaitTurnCompleted").mockResolvedValue({
-            threadId: response.sessionId,
+            threadId: "session-id",
             turn: {...turn, status: "completed"},
         });
 
         await codexAcpAgent.prompt({
-            sessionId: response.sessionId,
+            sessionId: "session-id",
             prompt: [{type: "text", text: "Create summary.md containing PINEAPPLE."}],
         });
 
@@ -403,6 +427,49 @@ describe("Session config options", () => {
             approvalPolicy, approvalsReviewer, sandboxPolicy,
         }));
         await expect(JSON.stringify(policies, null, 2) + "\n").toMatchFileSnapshot(`data/${modeId}-mode-policy.json`);
+    });
+
+    it.each([
+        {
+            source: "remote sandbox settings",
+            activePermissionProfileId: null,
+            turnSettings: {
+                approvalPolicy: "never", approvalsReviewer: "user",
+                sandboxPolicy: {type: "readOnly", networkAccess: true},
+                preservePermissionProfile: false, summary: "detailed", personality: null,
+            } satisfies PreservedTurnSettings,
+            expectedSettings: {
+                approvalPolicy: "never", approvalsReviewer: "user",
+                sandboxPolicy: {type: "readOnly", networkAccess: true}, summary: "detailed", personality: null,
+            },
+        },
+        {
+            source: "a remote permission profile",
+            activePermissionProfileId: ":workspace",
+            turnSettings: {
+                approvalPolicy: "never", approvalsReviewer: "user",
+                sandboxPolicy: {type: "workspaceWrite", writableRoots: [], networkAccess: true,
+                    excludeTmpdirEnvVar: false, excludeSlashTmp: false},
+                preservePermissionProfile: true, summary: "detailed", personality: null,
+            } satisfies PreservedTurnSettings,
+            expectedSettings: {summary: "detailed", personality: null},
+        },
+    ].flatMap(testCase => [false, true].flatMap(resume => [undefined, "unknown-mode"].map(initialMode => ({
+        ...testCase, resume, initialMode,
+    })))))("preserves $source without a valid initial mode override (resume=$resume, mode=$initialMode)", async ({
+        activePermissionProfileId, turnSettings, expectedSettings, resume, initialMode,
+    }) => {
+        vi.stubEnv("INITIAL_AGENT_MODE", initialMode);
+        const {fast} = buildModels();
+        const {fixture, codexAcpAgent} = await createSession("fast-model[medium]", [fast], {
+            activePermissionProfileId, turnSettings, resume,
+        });
+        const turnStart = mockPromptTurn(fixture, "session-id");
+
+        await codexAcpAgent.prompt({sessionId: "session-id", prompt: [{type: "text", text: "Continue"}]});
+
+        const {threadId, input, model, effort, serviceTier, clientUserMessageId, ...settings} = turnStart.mock.calls[0]![0];
+        expect(settings).toEqual(expectedSettings);
     });
 
     it("changes to a custom permission profile via setSessionConfigOption", async () => {

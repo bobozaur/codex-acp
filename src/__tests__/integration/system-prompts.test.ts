@@ -6,7 +6,7 @@ import {existsSync, mkdirSync, mkdtempSync, readFileSync} from "node:fs";
 import {join} from "node:path";
 import {Readable, Writable} from "node:stream";
 import {expect, it, vi} from "vitest";
-import {removeDirectoryWithRetry, writeCodexHomeConfig} from "../acp-test-utils";
+import {removeDirectoryWithRetry, stopTestCodexDaemon, writeCodexHomeConfig} from "../acp-test-utils";
 import {describeIntegration, INTEGRATION_MODEL_ID} from "./integration-fixture";
 import {startMockResponsesServer, textResponse} from "./mock-responses-server";
 import {developerText, findPromptRequest} from "./model-request";
@@ -156,6 +156,7 @@ describeIntegration("integration: client system prompts", () => {
                 try { await once(child, "exit"); } finally { clearTimeout(timeout); }
             }
             await mock.close();
+            await stopTestCodexDaemon(codexHome);
             removeDirectoryWithRetry(root);
         }
     });

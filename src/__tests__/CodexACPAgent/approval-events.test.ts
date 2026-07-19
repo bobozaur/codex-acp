@@ -606,6 +606,62 @@ describe("Approval Events", () => {
             await finish(prompt);
         });
 
+        it("waits for a foreign command approval to be resolved elsewhere", async () => {
+            const params = commandParams(["accept", "decline", "cancel"], {
+                threadId: "non-existent-session",
+                itemId: "item-no-handler",
+            });
+            const responsePromise = fixture.sendServerRequest(
+                "item/commandExecution/requestApproval",
+                params,
+                "foreign-command",
+            );
+            let settled = false;
+            void responsePromise.then(() => { settled = true; });
+            await Promise.resolve();
+            expect(settled).toBe(false);
+
+            fixture.sendServerNotification({
+                method: "serverRequest/resolved",
+                params: {threadId: params.threadId, requestId: "foreign-command"},
+            });
+
+            await expect(responsePromise).resolves.toEqual({decision: "cancel"});
+        });
+
+        it("resolves simultaneous same-thread foreign approvals independently", async () => {
+            const baseParams = commandParams(["accept", "decline", "cancel"], {
+                threadId: "remote-session",
+                itemId: "item-a",
+            });
+            const first = fixture.sendServerRequest(
+                "item/commandExecution/requestApproval",
+                baseParams,
+                "request-a",
+            );
+            const second = fixture.sendServerRequest(
+                "item/commandExecution/requestApproval",
+                {...baseParams, itemId: "item-b"},
+                "request-b",
+            );
+            let secondSettled = false;
+            void second.then(() => { secondSettled = true; });
+
+            fixture.sendServerNotification({
+                method: "serverRequest/resolved",
+                params: {threadId: baseParams.threadId, requestId: "request-a"},
+            });
+            await expect(first).resolves.toEqual({decision: "cancel"});
+            await Promise.resolve();
+            expect(secondSettled).toBe(false);
+
+            fixture.sendServerNotification({
+                method: "serverRequest/resolved",
+                params: {threadId: baseParams.threadId, requestId: "request-b"},
+            });
+            await expect(second).resolves.toEqual({decision: "cancel"});
+        });
+
         it("keeps concurrent approvalId callbacks request-local while reusing the item toolCallId", async () => {
             const prompt = setupSessionWithPendingPrompt();
             fixture.setPermissionResponse({outcome: {outcome: "selected", optionId: ApprovalOptionId.AllowOnce}});
@@ -763,6 +819,29 @@ describe("Approval Events", () => {
                 .toEqual({decision: "cancel"});
             await finish(cancelPrompt);
         });
+
+        it("waits for a foreign file approval to be resolved elsewhere", async () => {
+            const params = fileParams({
+                threadId: "non-existent-session",
+                itemId: "file-change-no-handler",
+            });
+            const responsePromise = fixture.sendServerRequest(
+                "item/fileChange/requestApproval",
+                params,
+                "foreign-file-change",
+            );
+            let settled = false;
+            void responsePromise.then(() => { settled = true; });
+            await Promise.resolve();
+            expect(settled).toBe(false);
+
+            fixture.sendServerNotification({
+                method: "serverRequest/resolved",
+                params: {threadId: params.threadId, requestId: "foreign-file-change"},
+            });
+
+            await expect(responsePromise).resolves.toEqual({decision: "cancel"});
+        });
     });
 
     describe("additional permission approvals", () => {
@@ -867,6 +946,34 @@ describe("Approval Events", () => {
                 strictAutoReview: false,
             });
             await finish(prompt);
+        });
+
+        it("waits for a foreign permissions request to be resolved elsewhere", async () => {
+            const requestParams = {
+                ...params(),
+                threadId: "non-existent-session",
+                itemId: "permissions-no-handler",
+            };
+            const responsePromise = fixture.sendServerRequest(
+                "item/permissions/requestApproval",
+                requestParams,
+                "foreign-permissions",
+            );
+            let settled = false;
+            void responsePromise.then(() => { settled = true; });
+            await Promise.resolve();
+            expect(settled).toBe(false);
+
+            fixture.sendServerNotification({
+                method: "serverRequest/resolved",
+                params: {threadId: requestParams.threadId, requestId: "foreign-permissions"},
+            });
+
+            await expect(responsePromise).resolves.toEqual({
+                permissions: {},
+                scope: "turn",
+                strictAutoReview: false,
+            });
         });
     });
 });

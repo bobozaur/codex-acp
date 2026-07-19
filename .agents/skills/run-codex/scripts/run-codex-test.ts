@@ -10,6 +10,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
+import {once} from "node:events";
 import {CodexAcpClient} from "../../../../src/CodexAcpClient";
 import {type CodexConnectionEvent, CodexAppServerClient} from "../../../../src/CodexAppServerClient";
 import {startCodexConnection} from "../../../../src/CodexJsonRpcConnection";
@@ -201,8 +202,18 @@ async function main() {
         console.error("Error:", err);
         process.exitCode = 1;
     } finally {
+        const child = codexConnection.process;
+        const exited = child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : once(child, "exit");
         codexConnection.connection.end();
-        codexConnection.process.kill();
+        // Give the test-owned proxy time to send its WebSocket close frame.
+        // Never stop the shared daemon or any existing Codex session.
+        const fallback = setTimeout(() => child.kill(), 1_000);
+        try {
+            await exited;
+        } finally {
+            clearTimeout(fallback);
+            codexConnection.connection.dispose();
+        }
     }
 }
 

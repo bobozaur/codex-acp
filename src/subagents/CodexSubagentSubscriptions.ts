@@ -6,6 +6,7 @@ import type {
 import type {ServerNotification} from "../app-server";
 import type {Thread} from "../app-server/v2";
 import {isRootAgentPath} from "./CodexAgentPath";
+import {getAppServerRequestId, tagAppServerRequest} from "../AppServerRequestContext";
 
 export type SubagentInteraction = <T>(
     sessionId: string, itemId: string | undefined, request: () => Promise<T>, turnId?: string | null,
@@ -150,7 +151,9 @@ export class CodexSubagentSubscriptions {
             && (other.current.rootSessionId === childSessionId || other.children.has(childSessionId)))) return false;
         session.children.add(childSessionId);
         this.client.onServerNotification(childSessionId, event => {
-            if ((event.params as {threadId?: unknown}).threadId !== childSessionId) return;
+            const threadId = event.method === "thread/started"
+                ? event.params.thread.id : (event.params as {threadId?: unknown}).threadId;
+            if (threadId !== childSessionId) return;
             this.discover(session, event);
             session.current.observeWorkEnd?.(event);
             if (session.current.supportsSubagents) session.current.dispatch(event);
@@ -176,25 +179,36 @@ export class CodexSubagentSubscriptions {
             handleCommandExecution: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
+                if (this.client.isServerRequestResolved(params)) return {decision: "cancel"};
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {decision: "cancel"};
-                const request = () => current.approvalHandler.handleCommandExecution({...params, threadId: sessionId});
+                const request = () => this.client.isServerRequestResolved(params)
+                    ? Promise.resolve({decision: "cancel" as const})
+                    : current.approvalHandler.handleCommandExecution(this.routedParams(params, sessionId));
                 return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
             handleFileChange: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
+                if (this.client.isServerRequestResolved(params)) return {decision: "cancel"};
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {decision: "cancel"};
-                const request = () => current.approvalHandler.handleFileChange({...params, threadId: sessionId});
+                const request = () => this.client.isServerRequestResolved(params)
+                    ? Promise.resolve({decision: "cancel" as const})
+                    : current.approvalHandler.handleFileChange(this.routedParams(params, sessionId));
                 return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
             handlePermissionsRequest: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
+                if (this.client.isServerRequestResolved(params)) {
+                    return {permissions: {}, scope: "turn", strictAutoReview: false};
+                }
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {permissions: {}, scope: "turn", strictAutoReview: false};
-                const request = () => current.approvalHandler.handlePermissionsRequest({...params, threadId: sessionId});
+                const request = () => this.client.isServerRequestResolved(params)
+                    ? Promise.resolve({permissions: {}, scope: "turn" as const, strictAutoReview: false})
+                    : current.approvalHandler.handlePermissionsRequest(this.routedParams(params, sessionId));
                 return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
         });
@@ -202,20 +216,36 @@ export class CodexSubagentSubscriptions {
             handleElicitation: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
+                if (this.client.isServerRequestResolved(params)) {
+                    return {action: "cancel", content: null, _meta: null};
+                }
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {action: "cancel", content: null, _meta: null};
-                const request = () => current.elicitationHandler.handleElicitation({...params, threadId: sessionId});
+                const request = () => this.client.isServerRequestResolved(params)
+                    ? Promise.resolve({action: "cancel" as const, content: null, _meta: null})
+                    : current.elicitationHandler.handleElicitation(this.routedParams(params, sessionId));
                 return current.withUserAction ? current.withUserAction(sessionId, undefined, request, params.turnId) : request();
             },
             handleUserInput: async (params) => {
                 const current = session.current;
                 await current.waitForRootNotifications();
+                if (this.client.isServerRequestResolved(params)) return {answers: {}};
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {answers: {}};
-                const request = () => current.elicitationHandler.handleUserInput({...params, threadId: sessionId});
+                const request = () => this.client.isServerRequestResolved(params)
+                    ? Promise.resolve({answers: {}})
+                    : current.elicitationHandler.handleUserInput(this.routedParams(params, sessionId));
                 return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
         });
+    }
+
+    private routedParams<T extends object & {threadId: string}>(params: T, threadId: string): T {
+        if (params.threadId === threadId) return params;
+        const routed = {...params, threadId};
+        const requestId = getAppServerRequestId(params);
+        if (requestId !== null) tagAppServerRequest(routed, requestId);
+        return routed;
     }
 
     private async interactionSessionId(

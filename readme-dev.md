@@ -1,11 +1,21 @@
 This package uses the bundled `@openai/codex` dependency by default.
-Set `CODEX_PATH` to run a different Codex binary; versions other than the one specified in `package.json` may not be compatible.
+By default, startup runs `codex remote-control start` and connects through `codex app-server proxy`, so ACP sessions use the managed Codex app-server daemon. Provider startup overrides use a dedicated stdio app-server process so each ACP client can apply its own routing. Set `CODEX_PATH` to run a different Codex binary; versions other than the one specified in `package.json` may not be compatible.
+
+The managed daemon can already be running a different version from the proxy executable. `codex app-server daemon version` reports both versions without restarting it. A proxy replacement checks `codex app-server daemon version` and reconnects directly when the daemon is running; a missing or stale daemon goes through `remote-control start` again. Startup configuration overrides apply when the daemon starts; an existing daemon keeps its startup configuration. Rebuilding the adapter takes effect when a new ACP process starts; existing processes keep their loaded code.
+
+Session loads stream history through the app-server's history cursors and paginated item API. Resuming an active thread also restores its turn snapshot through the paginated turn/item APIs. Live notifications wait behind history replay and then continue through the session's persistent event bridge. Legacy threads use `thread/read` history. A closed proxy rejects pending operations so the client can reconnect and reopen the persisted session.
+
+### Remote-control diagnostics
+
+`npm run test:remote-sync` runs an opt-in live test (`RUN_REMOTE_SYNC_TESTS=true`) against the existing managed daemon and authentication. It creates a separate test thread, exchanges local and remote prompts, steers during a six-second command, and compares both live transcripts with a fresh ACP history replay. It prints input acceptance, message materialization, and ACP forwarding timings. Cleanup disconnects only the test's proxies; it never restarts or stops the daemon or existing sessions. The test consumes model tokens and leaves its named test thread available for inspection. `CODEX_PATH` can select the proxy executable.
+
+A successful `turn/steer` acknowledges input acceptance, not immediate transcript insertion or model consumption. Core can defer the `userMessage` item until the running tool or sampling step ends. ACP cannot display a remote message before the server emits it. Compare acceptance-to-item and item-to-ACP timings separately; a local proxy test does not measure the mobile network or validate mobile rendering. Never resend an accepted message to manufacture an earlier echo.
 
 ### Runtime environment
 
 - `CODEX_API_KEY` - API key used when the API-key auth method is selected. Takes precedence over `OPENAI_API_KEY`.
 - `OPENAI_API_KEY` - fallback API key used when the API-key auth method is selected.
-- `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency.
+- `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency. The same executable is used for `remote-control start` and `app-server proxy`.
 - `CODEX_CONFIG` - JSON object merged into the Codex session config. `hooks` move to App Server startup (`-c hooks=...`) for AIR review; Codex rejects malformed hooks at startup and `initialize` reports its error.
 - `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
 - `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.
@@ -145,7 +155,8 @@ The adapter restarts the Codex app-server when it dies (for example, killed for 
   restart the app-server: it waits for a provider update in flight and succeeds. After a failed provider update it
   restarts again.
 - The app-server starts with the provider of the routing as `-c model_provider=…` and `-c model_providers.<id>=…`
-  overrides, for that process only; the user's `config.toml` is not changed. The provider is the gateway of
+  overrides in a dedicated stdio process; the user's `config.toml` and shared daemon are not changed. These sessions
+  do not receive remote-control updates through the shared daemon. The provider is the gateway of
   `providers/set` or of the `gateway` auth method, else `MODEL_PROVIDER`, else `model_provider` of `CODEX_CONFIG`.
   Header values go in `CODEX_ACP_PROVIDER_HEADER_<n>` environment variables through `env_http_headers`, so that they
   are not in the process arguments. Codex 0.166 and later refuse input for a thread whose provider is not the one of

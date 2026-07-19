@@ -88,9 +88,9 @@ describe("CodexEventHandler - Guardian approval review events", () => {
         ]);
 
         const dump = mockFixture.getAcpConnectionDump([]);
-        expect(dump).not.toContain("agent_message_chunk");
-        expect(dump).not.toContain("Guardian warning");
-        expect(dump).not.toContain("Automatic approval review approved");
+        expect(dump).toContain("agent_message_chunk");
+        expect(dump).toContain("Guardian warning");
+        expect(dump).toContain("Automatic approval review approved");
         expect(dump).toContain("tool_call_update");
         expect(dump).toContain("Authorization: medium");
         await expect(dump).toMatchFileSnapshot(

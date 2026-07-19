@@ -67,7 +67,7 @@ function startAcpServer() {
     const startup = appServerStartup(startupState);
     const codexProcessState: CodexProcessState = {
         // The supervisor disposes the connection itself, after the last output of the process was read.
-        connection: startCodexConnection(codexPath, {...process.env, ...startup.env}, startup.args, {disposeOnExit: false}),
+        connection: startCodexConnection(codexPath, {...process.env, ...startup.env}, startup.args, {disposeOnExit: false, providerStartupConfig: startupState.providerStartupConfig}),
         codexPath,
         config: hookConfig.sessionConfig,
         ...startupState,

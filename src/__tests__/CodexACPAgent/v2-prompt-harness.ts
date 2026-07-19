@@ -5,7 +5,8 @@ import {createAcpAgentRouter} from '../../AcpAgentRouter';
 import {CodexAcpServer} from '../../CodexAcpServer';
 import {CodexAcpClient} from '../../CodexAcpClient';
 import {CodexAppServerClient} from '../../CodexAppServerClient';
-import type {ServerNotification} from '../../app-server';
+import type {RequestId, ServerNotification} from '../../app-server';
+import {tagAppServerRequest} from '../../AppServerRequestContext';
 import type {Thread, ThreadItem, Turn, TurnStatus} from '../../app-server/v2';
 import type {McpStartupResult} from '../../mcp/McpStartupTracker';
 import {createTestModel} from '../acp-test-utils';
@@ -133,7 +134,7 @@ export type PromptSession = {
      * invoking the handler `CodexAppServerClient` registered for it (e.g.
      * `CommandExecutionApprovalRequest.method`).
      */
-    triggerApproval(method: string, params: unknown): Promise<unknown>;
+    triggerApproval(method: string, params: unknown, requestId?: RequestId): Promise<unknown>;
     /** The `{threadId, turnId}` params of every `turn/interrupt` sent to Codex so far, in order. */
     turnInterruptCalls(): Array<{threadId: string, turnId: string}>;
     /** The agent instance behind the connection, for spying on private methods (e.g. `restartCodexClient`). */
@@ -166,6 +167,7 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
     onAgent?: (agent: CodexAcpServer) => void,
 } = {}): Promise<PromptSession> {
     const mocks = createMockConnections();
+    let nextServerRequestId = 0;
     const transcript: TranscriptEntry[] = [];
     const wireMessages: acpV2.AnyMessage[] = [];
     const scopedUpdates: PromptSession["scopedUpdates"] = [];
@@ -371,11 +373,12 @@ export async function connectSession(protocolVersion: 1 | 2 = 2, options: {
             await vi.waitFor(() => expect(promptSpy.mock.results.length).toBeGreaterThan(index));
             await promptSpy.mock.results[index]!.value.catch(() => {});
         },
-        triggerApproval: async (method, params) => {
+        triggerApproval: async (method, params, requestId) => {
             const handler = mocks.getRequestHandler(method);
             if (!handler) {
                 throw new Error(`No handler registered for '${method}'`);
             }
+            tagAppServerRequest(params, requestId ?? ++nextServerRequestId);
             return await handler(params);
         },
         turnInterruptCalls: () => mocks.mockCodexConnection.sendRequest.mock.calls

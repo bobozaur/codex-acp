@@ -20,7 +20,9 @@ import open from "open";
 import type {Disposable} from "vscode-jsonrpc";
 import type {
     ClientInfo,
+    Personality,
     ReasoningEffort,
+    ReasoningSummary,
     ServerNotification
 } from "./app-server";
 import type {ServiceTier} from "./app-server/ServiceTier";
@@ -70,7 +72,7 @@ import type {ModeKind} from "./app-server/ModeKind";
 import {arePathBasenamesEqual, arePathsEqual, isAbsolutePathLike, isAbsoluteProtocolPath} from "./PathUtils";
 import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
 import {forkSession as runForkSession} from "./SessionFork";
-import type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
+import type {PreservedTurnSettings, SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 import {runAccountLogin} from "./CodexAccountLogin";
 import {throwIfRequestCancelled, withRequestCancellation} from "./RequestCancellation";
 import {
@@ -80,6 +82,7 @@ import {
     isThreadNotFoundError,
     isThreadNotLoadedError,
     isUnknownThreadError,
+    parseActiveTurnSteerRace,
     threadActiveWriterRequestError,
 } from "./CodexThreadErrors";
 import {airCustomInstructions} from "./AirExtension";
@@ -94,7 +97,8 @@ import {
 import {findSupportedEffort} from "./ModelConfigOption";
 import {type ProviderStartupConfig, configOverride, NO_PROVIDER_STARTUP_CONFIG} from "./CodexConfigOverride";
 import {disableUnsupportedSkills, withoutUnsupportedSkills} from "./UnsupportedSkills";
-export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
+import {hydrateThreadHistory, readThreadHistory} from "./ThreadHistory";
+export type {PreservedTurnSettings, SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 /** A null turn marks unavailable outcome metadata, not a failed turn. */
 export type RecordedSubagentEntry = {item: ThreadItem; completed: boolean; turnId?: string} | {turn: Turn | null};
 
@@ -113,6 +117,11 @@ type ResumedThread = {
     materialized: boolean;
     /** The mode that the resume response reports. Null when the thread has no rollout yet. */
     collaborationMode: ModeKind | null;
+    turnsBackwardsCursor: string | null;
+    cwd?: string;
+    approvalPolicy?: AskForApproval;
+    approvalsReviewer?: ApprovalsReviewer;
+    sandbox?: SandboxPolicy;
 };
 
 /**
@@ -227,6 +236,7 @@ export class CodexAcpClient {
             }
         });
         this.configPath = response?.codexHome ?? null;
+        this.codexClient.initialized();
         this.isInitialized = true;
     }
 
@@ -644,6 +654,8 @@ export class CodexAcpClient {
         try {
             const response = await this.codexClient.threadResume(params);
             return {
+                ...response,
+                turnsBackwardsCursor: response.turnsBackwardsCursor ?? null,
                 thread: response.thread,
                 model: response.model,
                 modelProvider: response.modelProvider,
@@ -679,6 +691,7 @@ export class CodexAcpClient {
                 // yet"), and there is nothing to list either way.
                 itemsBackwardsCursor: null,
                 materialized: false,
+                turnsBackwardsCursor: null,
                 collaborationMode: null,
             };
         }
@@ -704,8 +717,13 @@ export class CodexAcpClient {
             ...(instructions?.text !== undefined ? {developerInstructions: instructions.developerInstructions} : {}),
         }, request, previousInstructions);
         onSubscribed?.();
+        const thread = response.materialized && response.thread.status?.type === "active"
+            ? await hydrateThreadHistory(this.codexClient, response.thread, response)
+            : response.thread;
         const codexModels = await this.fetchAvailableModels();
         const currentModelId = this.createModelId(codexModels, response.model, response.reasoningEffort).toString();
+        const threadSettings = this.codexClient.getThreadSettings(response.thread.id);
+        const turnSettings = createPreservedTurnSettings(response, threadSettings);
         return {
             sessionId: request.sessionId,
             currentModelId: currentModelId,
@@ -721,6 +739,10 @@ export class CodexAcpClient {
             ...(instructions ? {instructions} : {}),
             activePermissionProfileId: response.materialized ? response.activePermissionProfileId : defaultPermissionProfileId ?? null,
             ...permissionProfileMetadata,
+            cwd: response.cwd ?? request.cwd,
+            ...(turnSettings ? {turnSettings} : {}),
+            activeTurnId: findActiveTurnId(thread),
+            ...(Array.isArray(thread.turns) ? {threadSnapshot: thread} : {}),
         }
     }
 
@@ -771,6 +793,7 @@ export class CodexAcpClient {
         // A null paginated cursor means there was no durable history at resume time.
         let thread: Thread = {...response.thread, turns: []};
         let history: AsyncIterable<ThreadItemEntry[]> = noItems();
+        let threadSnapshot: Thread | undefined;
         if (response.materialized && response.thread.historyMode === "paginated") {
             if (response.itemsBackwardsCursor !== null) {
                 history = this.codexClient.threadItemEntryPages(
@@ -781,6 +804,7 @@ export class CodexAcpClient {
         } else if (response.materialized) {
             // A legacy store reads the whole history in one request.
             const legacy = (await this.codexClient.threadReadWithHistory(response.thread.id)).thread;
+            threadSnapshot = legacy;
             thread = {...legacy, turns: []};
             history = oneItemPage(legacy.turns.flatMap(turn => turn.items.map(item => ({
                 turnId: turn.id,
@@ -789,8 +813,19 @@ export class CodexAcpClient {
                 completedAtMs: null,
             }))));
         }
+        let activeTurnId = findActiveTurnId(threadSnapshot ?? response.thread);
+        if (response.materialized && response.thread.historyMode === "paginated" && response.thread.status?.type === "active"
+            && response.turnsBackwardsCursor !== null) {
+            const latest = await this.codexClient.threadTurnsList({
+                threadId: response.thread.id, cursor: response.turnsBackwardsCursor,
+                limit: 1, sortDirection: "desc", itemsView: "notLoaded",
+            });
+            activeTurnId = latest.data.find(turn => turn.status === "inProgress")?.id ?? null;
+        }
         const codexModels = await this.fetchAvailableModels();
         const currentModelId = this.createModelId(codexModels, response.model, response.reasoningEffort).toString();
+        const threadSettings = this.codexClient.getThreadSettings(response.thread.id);
+        const turnSettings = createPreservedTurnSettings(response, threadSettings);
         return {
             sessionId: request.sessionId,
             currentModelId: currentModelId,
@@ -799,6 +834,10 @@ export class CodexAcpClient {
             collaborationMode: response.collaborationMode ?? this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
             currentServiceTier: response.serviceTier ?? null,
+            cwd: response.cwd ?? request.cwd,
+            ...(turnSettings ? {turnSettings} : {}),
+            activeTurnId,
+            ...(threadSnapshot ? {threadSnapshot} : {}),
             thread,
             history,
             additionalDirectories,
@@ -833,6 +872,10 @@ export class CodexAcpClient {
             first += page.length;
         }
         return null;
+    }
+
+    async readSessionThread(sessionId: string): Promise<Thread> {
+        return await readThreadHistory(this.codexClient, sessionId);
     }
 
     /** Lazy history reads let the caller restore verified live delivery before reading snapshots. */
@@ -877,6 +920,8 @@ export class CodexAcpClient {
             throw new Error("Codex did not return any models");
         }
         const currentModelId = this.createModelId(codexModels, response.model, response.reasoningEffort).toString();
+        const threadSettings = this.codexClient.getThreadSettings(response.thread.id);
+        const turnSettings = createPreservedTurnSettings(response, threadSettings);
         return {
             sessionId: response.thread.id,
             currentModelId: currentModelId,
@@ -889,6 +934,10 @@ export class CodexAcpClient {
             ...(instructions ? {instructions} : {}),
             activePermissionProfileId: response.activePermissionProfile?.id ?? null,
             ...permissionProfileMetadata,
+            cwd: response.cwd ?? request.cwd,
+            ...(turnSettings ? {turnSettings} : {}),
+            activeTurnId: findActiveTurnId(response.thread),
+            ...(Array.isArray(response.thread.turns) ? {threadSnapshot: response.thread} : {}),
         };
     }
 
@@ -1364,6 +1413,19 @@ export class CodexAcpClient {
         }
     }
 
+    async pauseSessionNotifications(sessionId: string): Promise<() => void> {
+        const previous = this.sessionNotificationQueues.get(sessionId);
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        this.enqueueSessionNotification(sessionId, () => gate);
+        await previous;
+        return release;
+    }
+
+    enqueueSessionNotificationBoundary(sessionId: string, operation: () => void): void {
+        this.enqueueSessionNotification(sessionId, operation);
+    }
+
     private enqueueSessionNotification(sessionId: string, operation: () => void | Promise<void>): void {
         const run = async () => {
             try {
@@ -1393,7 +1455,9 @@ export class CodexAcpClient {
         additionalDirectories: string[],
         onTurnStarted?: (turnId: string) => void,
         shouldCancel?: () => boolean,
+        activeTurnId?: string | null,
         clientUserMessageId?: string,
+        preservedSettings?: PreservedTurnSettings,
     ): Promise<TurnCompletedNotification | null> {
         const input = buildPromptItems(request.prompt);
         const effort = modelId.effort as ReasoningEffort | null; //TODO remove unsafe conversion
@@ -1401,19 +1465,60 @@ export class CodexAcpClient {
         if (shouldCancel?.()) {
             return null;
         }
-        const permissionProfileId = agentMode.permissionProfileId;
+        if (activeTurnId) {
+            let expectedTurnId = activeTurnId;
+            let retriedAfterMismatch = false;
+            while (true) {
+                try {
+                    return await this.codexClient.runSteer({
+                        threadId: request.sessionId,
+                        input,
+                        expectedTurnId,
+                        ...(clientUserMessageId ? {clientUserMessageId} : {}),
+                    }, onTurnStarted);
+                } catch (error) {
+                    const race = parseActiveTurnSteerRace(error);
+                    if (race?.type === "missing") {
+                        break;
+                    }
+                    if (race?.type === "mismatch" && !retriedAfterMismatch && race.actualTurnId !== expectedTurnId) {
+                        if (shouldCancel?.()) {
+                            return null;
+                        }
+                        expectedTurnId = race.actualTurnId;
+                        retriedAfterMismatch = true;
+                        continue;
+                    }
+                    throw error;
+                }
+            }
+        }
+
+        if (shouldCancel?.()) {
+            return null;
+        }
         return await this.codexClient.runTurn({
             threadId: request.sessionId,
             input: input,
-            approvalPolicy: agentMode.approvalPolicy,
-            approvalsReviewer: agentMode.approvalsReviewer,
-            ...(permissionProfileId
-                ? {
-                    permissions: permissionProfileId,
-                    runtimeWorkspaceRoots: [cwd, ...additionalDirectories],
-                }
-                : {sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy!, additionalDirectories)}),
-            summary: disableSummary ? "none" : "auto",
+            ...(!preservedSettings?.preservePermissionProfile ? {
+                approvalPolicy: preservedSettings?.approvalPolicy ?? agentMode.approvalPolicy,
+                approvalsReviewer: preservedSettings?.approvalsReviewer ?? agentMode.approvalsReviewer,
+                ...(agentMode.permissionProfileId && !preservedSettings
+                    ? {
+                        permissions: agentMode.permissionProfileId,
+                        runtimeWorkspaceRoots: [cwd, ...additionalDirectories],
+                    }
+                    : {sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(
+                        preservedSettings?.sandboxPolicy ?? agentMode.sandboxPolicy!,
+                        additionalDirectories,
+                    )}),
+            } : {}),
+            summary: disableSummary
+                ? "none"
+                : preservedSettings?.summary !== undefined
+                    ? preservedSettings.summary
+                    : "auto",
+            ...(preservedSettings?.personality !== undefined ? {personality: preservedSettings.personality} : {}),
             effort: effort,
             model: modelId.model,
             serviceTier: serviceTier,
@@ -1602,6 +1707,47 @@ export type SessionConfig = {
     permissionProfiles?: PermissionProfileSummary[],
 }
 
+function findActiveTurnId(thread: Thread): string | null {
+    const turns = Array.isArray(thread.turns) ? thread.turns : [];
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+        const turn = turns[index]!;
+        if (turn.status === "inProgress") {
+            return turn.id;
+        }
+    }
+    return null;
+}
+
+function createPreservedTurnSettings(
+    response: {
+        approvalPolicy?: AskForApproval,
+        approvalsReviewer?: ApprovalsReviewer,
+        sandbox?: SandboxPolicy,
+        activePermissionProfile?: {id: string} | null,
+        activePermissionProfileId?: string | null,
+    },
+    settings?: {
+        approvalPolicy: AskForApproval,
+        approvalsReviewer: ApprovalsReviewer,
+        sandboxPolicy: SandboxPolicy,
+        activePermissionProfile: unknown,
+        summary: ReasoningSummary | null,
+        personality: Personality | null,
+    },
+): PreservedTurnSettings | undefined {
+    const approvalPolicy = settings?.approvalPolicy ?? response.approvalPolicy;
+    const approvalsReviewer = settings?.approvalsReviewer ?? response.approvalsReviewer;
+    const sandboxPolicy = settings?.sandboxPolicy ?? response.sandbox;
+    if (approvalPolicy === undefined || approvalsReviewer === undefined || sandboxPolicy === undefined) return undefined;
+    return {
+        approvalPolicy,
+        approvalsReviewer,
+        sandboxPolicy,
+        preservePermissionProfile: settings?.activePermissionProfile != null
+            || response.activePermissionProfile != null || response.activePermissionProfileId != null,
+        ...(settings ? {summary: settings.summary, personality: settings.personality} : {}),
+    };
+}
 function buildPromptItems(prompt: acp.ContentBlock[]): UserInput[] {
     return prompt.map((block): UserInput | null => {
         switch (block.type) {

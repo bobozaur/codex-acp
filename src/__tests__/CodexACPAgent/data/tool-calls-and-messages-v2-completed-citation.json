@@ -1,0 +1,18 @@
+[
+  {
+    "messageId": "completed-citation",
+    "content": {
+      "text": "See ",
+      "type": "text"
+    },
+    "sessionUpdate": "agent_message_chunk"
+  },
+  {
+    "messageId": "completed-citation",
+    "content": {
+      "text": "[src/a.ts](/workspace/src/a.ts) for details.",
+      "type": "text"
+    },
+    "sessionUpdate": "agent_message_chunk"
+  }
+]

@@ -18,13 +18,21 @@ import type {
     ConfigWarningNotification,
     DeprecationNoticeNotification,
     ErrorNotification,
+    FileChangePatchUpdatedNotification,
+    GuardianWarningNotification,
+    HookCompletedNotification,
+    HookStartedNotification,
     ItemCompletedNotification,
     ItemStartedNotification,
+    Thread,
     ThreadItem,
     ModelReroutedNotification,
     ReasoningSummaryPartAddedNotification,
     ReasoningSummaryTextDeltaNotification,
     ReasoningTextDeltaNotification,
+    ThreadRealtimeAudioChunk,
+    ThreadRealtimeTranscriptDeltaNotification,
+    ThreadRealtimeTranscriptDoneNotification,
     ThreadGoalClearedNotification,
     ThreadGoalUpdatedNotification,
     ThreadTokenUsageUpdatedNotification,
@@ -50,9 +58,12 @@ import {WebSearchReporter} from "./tool-calls/reporters/WebSearchReporter";
 import {CodexPlanStream, structuredPlanUpdate} from "./CodexPlanStream";
 import {isWorkspaceRoutingUnavailableMessage} from "./CodexThreadErrors";
 import {
-    createMessagePhaseMeta,
+    createCodexMessageMeta,
+    createAgentMessageChunk,
     createAgentTextMessageChunk,
     createAgentTextThoughtChunk,
+    createUserMessageChunk,
+    userInputToContentBlocks,
 } from "./ContentChunks";
 import {goalSessionInfoUpdate, sameThreadGoalSnapshot, toThreadGoalSnapshot} from "./ThreadGoalSnapshot";
 import {logger} from "./Logger";
@@ -219,10 +230,26 @@ export class CodexEventHandler {
     private readonly childTurnDiffs = new Map<string, {rootTurnId: string; diff: string | null}>();
     /** The last root turn that ended, for subagent turns that outlive it. */
     private latestRootTurnId: string | null = null;
-    private readonly collectTurnDiffs: boolean;
+    private collectTurnDiffs: boolean;
     private readonly subagents: SubagentEventRouter;
     /** Connection-level `authStatus` sink; the app-server account push feeds it. */
     private readonly onAccountUpdated: ((notification: AccountUpdatedNotification) => void) | undefined;
+    private readonly agentMessageMetadata = new Map<string, Pick<Extract<ThreadItem, {type: "agentMessage"}>, "phase" | "memoryCitation">>();
+    private readonly emittedAgentMessageText = new Map<string, string>();
+    private readonly pendingLocalUserMessageIds = new Set<string>();
+    private readonly reviewTurnIds = new Set<string>();
+    private readonly renderedUserMessageItemIds = new Set<string>();
+    private readonly startedItemIds = new Set<string>();
+    private readonly completedItemIds = new Set<string>();
+    private readonly emittedToolCallIds = new Set<string>();
+    private readonly snapshotPendingAgentText = new Map<string, string>();
+    private readonly snapshotPendingReasoningSummaryText = new Map<string, string>();
+    private readonly snapshotPendingReasoningRawText = new Map<string, string>();
+    private readonly emittedReasoningSummaryText = new Map<string, string>();
+    private readonly emittedReasoningRawText = new Map<string, string>();
+    private readonly realtimeTranscripts = new Map<string, {messageId: string, text: string}>();
+    private realtimeAudioMessageId: string | null = null;
+    private standaloneMessageSequence = 0;
 
     constructor(
         connection: AcpClientConnection,
@@ -247,6 +274,14 @@ export class CodexEventHandler {
         if (sessionState.sessionFailure !== undefined) {
             this.failuresById.set(sessionState.sessionFailure.id, sessionState.sessionFailure);
         }
+    }
+
+    setCollectTurnDiffs(collect: boolean): void {
+        this.collectTurnDiffs = collect;
+        this.turnDiffs.clear();
+        this.oversizedTurnDiffs.clear();
+        this.childTurnDiffs.clear();
+        this.latestRootTurnId = null;
     }
 
     getFailure(): RequestError | null {
@@ -306,9 +341,9 @@ export class CodexEventHandler {
     }
 
     /**
-     * Handles notifications after the prompt-local handler has been disposed. The app-server subscription
-     * remains installed until the ACP session closes, so terminal errors need a durable session-level path
-     * instead of entering a turn buffer that will never be flushed.
+     * Handles notifications while no ACP prompt owns the session. The app-server subscription remains
+     * installed until the ACP session closes, so terminal errors need a durable session-level path instead
+     * of entering a turn buffer that may never be flushed.
      */
     async handleSessionScopedNotification(notification: ServerNotification): Promise<void> {
         const threadId = (notification.params as {threadId?: unknown}).threadId;
@@ -477,9 +512,11 @@ export class CodexEventHandler {
         }
         if (handledBySubagents) return;
         if (ignoredBySubagents) return;
-        if (updateEvent === undefined) updateEvent = await this.createUpdateEvent(notification);
-        if (updateEvent) {
-            await this.publishUpdate(updateEvent, this.subagents.notificationSessionId(notification));
+        const updateEvents = updateEvent === undefined
+            ? await this.createUpdateEvents(notification)
+            : updateEvent === null ? [] : [updateEvent];
+        for (const event of updateEvents) {
+            await this.publishUpdate(event, this.subagents.notificationSessionId(notification));
         }
     }
 
@@ -550,6 +587,7 @@ export class CodexEventHandler {
         this.turnDiffs.clear();
         this.oversizedTurnDiffs.clear();
         this.childTurnDiffs.clear();
+        this.finishSnapshotReplay();
     }
 
     /** Subagent threads report their own turn diffs; the root turn's file-change report must include them. */
@@ -563,6 +601,118 @@ export class CodexEventHandler {
         if (rootTurnId === null) return;
         const oversized = Buffer.byteLength(params.diff, "utf8") > AGENT_FILE_CHANGE_REPORT_MAX_DIFF_BYTES;
         this.childTurnDiffs.set(key, {rootTurnId, diff: oversized ? null : params.diff});
+    }
+
+    clearFailure(): void {
+        this.failure = null;
+        this.completedPlan = null;
+        if (this.sessionState.currentTurnId === null && this.pendingErrors.length > 0) {
+            logger.log("Discarding session-scoped app-server errors before a new ACP prompt", {
+                sessionId: this.sessionState.sessionId,
+                count: this.pendingErrors.length,
+                turnIds: this.pendingErrors.map(error => error.turnId),
+            });
+            this.pendingErrors.splice(0);
+        }
+    }
+
+    registerLocalUserMessage(clientUserMessageId: string): void {
+        this.pendingLocalUserMessageIds.add(clientUserMessageId);
+    }
+
+    discardLocalUserMessage(clientUserMessageId: string): void {
+        this.pendingLocalUserMessageIds.delete(clientUserMessageId);
+    }
+
+    seedThreadSnapshot(thread: Thread): void {
+        for (const turn of thread.turns) {
+            this.seedSnapshotItems(turn.items, turn.status !== "inProgress", thread.id);
+            if (turn.status === "inProgress") {
+                for (const item of turn.items) this.observeReviewMode(item, thread.id, turn.id);
+            }
+        }
+    }
+
+    seedHistoryItems(items: ThreadItem[]): void {
+        this.seedSnapshotItems(items, false, this.sessionState.sessionId);
+    }
+
+    private seedSnapshotItems(items: ThreadItem[], turnCompleted: boolean, threadId: string): void {
+        for (const item of items) {
+            this.startedItemIds.add(`${threadId}:${item.id}`);
+            if (turnCompleted) {
+                this.completedItemIds.add(`${threadId}:${item.id}`);
+            }
+            switch (item.type) {
+                case "userMessage":
+                    this.renderedUserMessageItemIds.add(`${threadId}:${item.id}`);
+                    break;
+                case "agentMessage":
+                    if (!turnCompleted) {
+                        this.rememberAgentMessage(item, threadId);
+                        this.emittedAgentMessageText.set(`${threadId}:${item.id}`, item.text);
+                        this.snapshotPendingAgentText.set(`${threadId}:${item.id}`, item.text);
+                    }
+                    break;
+                case "reasoning":
+                    if (!turnCompleted) {
+                        this.emittedReasoningSummaryText.set(`${threadId}:${item.id}`, this.reasoningSummaryText(item));
+                        this.emittedReasoningRawText.set(`${threadId}:${item.id}`, this.reasoningRawText(item));
+                        this.snapshotPendingReasoningSummaryText.set(`${threadId}:${item.id}`, this.reasoningSummaryText(item));
+                        this.snapshotPendingReasoningRawText.set(`${threadId}:${item.id}`, this.reasoningRawText(item));
+                    }
+                    break;
+                case "commandExecution":
+                    this.emittedToolCallIds.add(`${threadId}:${item.id}`);
+                    this.streamsFor(threadId).commands.started(item);
+                    break;
+                case "fileChange":
+                case "mcpToolCall":
+                case "dynamicToolCall":
+                case "collabAgentToolCall":
+                case "subAgentActivity":
+                case "webSearch":
+                case "imageView":
+                case "imageGeneration":
+                case "contextCompaction":
+                    this.emittedToolCallIds.add(`${threadId}:${item.id}`);
+                    break;
+                case "hookPrompt":
+                case "functionCallOutput":
+                case "plan":
+                case "sleep":
+                case "enteredReviewMode":
+                case "exitedReviewMode":
+                    break;
+            }
+        }
+    }
+
+    finishSnapshotReplay(): void {
+        this.snapshotPendingAgentText.clear();
+        this.snapshotPendingReasoningSummaryText.clear();
+        this.snapshotPendingReasoningRawText.clear();
+    }
+
+    private async createUpdateEvents(notification: ServerNotification): Promise<UpdateSessionEvent[]> {
+        if (notification.method === "item/started" || notification.method === "item/completed") {
+            this.observeReviewMode(notification.params.item, notification.params.threadId, notification.params.turnId);
+        }
+        if (notification.method === "item/started" && notification.params.item.type === "userMessage") {
+            this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
+            return this.createUserMessageEvents(notification.params.item, notification.params.threadId, notification.params.turnId);
+        }
+        if (notification.method === "item/completed" && notification.params.item.type === "userMessage") {
+            this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
+            if (this.completedItemIds.has(`${notification.params.threadId}:${notification.params.item.id}`)) {
+                return [];
+            }
+            const updates = this.createUserMessageEvents(notification.params.item, notification.params.threadId, notification.params.turnId);
+            this.completedItemIds.add(`${notification.params.threadId}:${notification.params.item.id}`);
+            return updates;
+        }
+        const update = await this.createUpdateEvent(notification);
+        return update ? [update] : [];
     }
 
     private async createUpdateEvent(notification: ServerNotification): Promise<UpdateSessionEvent | null> {
@@ -619,12 +769,15 @@ export class CodexEventHandler {
                 await this.flushPendingErrors();
                 return null;
             case "turn/completed":
+                this.reviewTurnIds.delete(`${notification.params.threadId}:${notification.params.turn.id}`);
                 await this.plans.flush();
                 this.plans.clearTurn();
                 // Subagents can keep running after the root turn ends; their turns still belong to it.
                 this.latestRootTurnId = this.sessionState.currentTurnId ?? this.latestRootTurnId;
-                this.sessionState.currentTurnId = null;
-                this.sessionState.interruptTurnId = null;
+                if (this.sessionState.currentTurnId === notification.params.turn.id) {
+                    this.sessionState.currentTurnId = null;
+                    this.sessionState.interruptTurnId = null;
+                }
                 if (this.session.protocolVersion === 2 && notification.params.turn.status === "failed") {
                     for (const update of this.sessionState.openToolCalls.finishOutstanding()) {
                         await this.session.update(update, this.subagents.notificationSessionId(notification));
@@ -689,7 +842,7 @@ export class CodexEventHandler {
             case "warning":
                 return this.createWarningEvent(notification.params);
             case "guardianWarning":
-                return null;
+                return this.createGuardianWarningEvent(notification.params);
             case "deprecationNotice":
                 return this.createDeprecationNoticeEvent(notification.params);
             case "item/autoApprovalReview/started":
@@ -704,10 +857,10 @@ export class CodexEventHandler {
                     : this.createContextCompactedEvent();
             case "item/reasoning/summaryTextDelta":
                 this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
-                return this.createReasoningDeltaEvent(notification.params);
+                return this.createReasoningDeltaEvent(notification.params, "summary");
             case "item/reasoning/textDelta":
                 this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
-                return this.createReasoningDeltaEvent(notification.params);
+                return this.createReasoningDeltaEvent(notification.params, "raw");
             case "item/reasoning/summaryPartAdded":
                 this.completeRetryIncidentOnTurnProgress(notification.params.threadId);
                 return this.createReasoningSectionBreakEvent(notification.params);
@@ -739,39 +892,67 @@ export class CodexEventHandler {
             // Read markers and predictions have no ACP session update counterpart.
             case "thread/readState/changed":
             case "thread/prediction/updated":
+                return null;
+            case "item/fileChange/patchUpdated":
+                return await this.createFileChangePatchEvent(notification.params);
+            case "hook/started":
+                return this.createHookStartedEvent(notification.params);
+            case "hook/completed":
+                return this.createHookCompletedEvent(notification.params);
+            case "thread/realtime/transcript/delta":
+                return this.createRealtimeTranscriptDeltaEvent(notification.params);
+            case "thread/realtime/transcript/done":
+                return this.createRealtimeTranscriptDoneEvent(notification.params);
+            case "thread/realtime/error":
+                return createAgentTextMessageChunk(
+                    `Realtime error: ${notification.params.message}\n\n`,
+                    this.nextStandaloneMessageId("realtime-error"),
+                );
+            case "thread/realtime/started":
+                return this.createCodexSessionInfoUpdate({realtime: {
+                    status: "started",
+                    sessionId: notification.params.realtimeSessionId,
+                    version: notification.params.version,
+                }});
+            case "thread/realtime/itemAdded":
+                return this.createCodexSessionInfoUpdate({realtimeItem: notification.params.item});
+            case "thread/realtime/outputAudio/delta":
+                return this.createRealtimeAudioEvent(notification.params.audio);
+            case "thread/realtime/closed":
+                this.realtimeAudioMessageId = null;
+                return this.createCodexSessionInfoUpdate({realtime: {
+                    status: "closed",
+                    reason: notification.params.reason,
+                }});
             case "thread/deleted":
+                return this.createCodexSessionInfoUpdate({deleted: true});
+            case "remoteControl/status/changed":
+                return this.createCodexSessionInfoUpdate({remoteControl: notification.params});
+            case "model/verification":
+                return this.createCodexSessionInfoUpdate({modelVerification: notification.params.verifications});
+            case "model/safetyBuffering/updated":
+                return this.createCodexSessionInfoUpdate({modelSafetyBuffering: notification.params});
+            // ignored events
+            case "command/exec/outputDelta":
             case "thread/reverted":
             case "thread/queue/changed":
             case "project/changed":
             case "thread/project/updated":
             case "thread/environment/connected":
             case "thread/environment/disconnected":
-            case "command/exec/outputDelta":
-            case "hook/started":
-            case "hook/completed":
             case "turn/moderationMetadata":
             case "item/fileChange/outputDelta":
-            case "item/fileChange/patchUpdated":
             case "fs/changed":
             case "mcpServer/startupStatus/updated":
             case "mcpServer/event/stream/notification":
             case "serverRequest/resolved":
-            case "model/verification":
             case "modelProvider/authRecoveryStarted":
             case "modelProvider/authRecoveryCompleted":
-            case "model/safetyBuffering/updated":
             case "windows/worldWritableWarning":
-            case "thread/realtime/started":
-            case "thread/realtime/itemAdded":
             case "thread/realtime/item/started":
             case "thread/realtime/item/transcript/delta":
             case "thread/realtime/item/completed":
-            case "thread/realtime/transcript/delta":
-            case "thread/realtime/transcript/done":
-            case "thread/realtime/outputAudio/delta":
             case "thread/realtime/sdp":
-            case "thread/realtime/error":
-            case "thread/realtime/closed":
             case "windowsSandbox/setupCompleted":
             case "account/login/completed":
             case "mcpServer/oauthLogin/completed":
@@ -779,7 +960,6 @@ export class CodexEventHandler {
             case "rawResponseItem/completed":
             case "rawResponse/completed":
             case "thread/started":
-            case "remoteControl/status/changed":
             case "app/list/updated":
             case "thread/settings/updated":
             case "externalAgentConfig/import/progress":
@@ -816,13 +996,17 @@ export class CodexEventHandler {
     }
 
     private async createTextEvent(event: AgentMessageDeltaNotification): Promise<UpdateSessionEvent | null> {
+        if (this.completedItemIds.has(`${event.threadId}:${event.itemId}`)) return null;
+        const delta = this.reconcileSnapshotDelta(this.snapshotPendingAgentText, `${event.threadId}:${event.itemId}`, event.delta);
+        if (delta.length === 0) return null;
+        this.appendEmittedText(this.emittedAgentMessageText, `${event.threadId}:${event.itemId}`, delta);
         const streams = this.streamsFor(event.threadId);
         let citations = streams.agentMessageCitations.get(event.itemId);
         if (citations === undefined) {
             citations = new FileCitationStream(this.sessionState.cwd);
             streams.agentMessageCitations.set(event.itemId, citations);
         }
-        return this.createAgentMessageText(citations.push(event.delta), event.itemId, event.threadId);
+        return this.createAgentMessageText(citations.push(delta), event.itemId, event.threadId);
     }
 
     /**
@@ -833,14 +1017,18 @@ export class CodexEventHandler {
         const streams = this.streamsFor(threadId);
         const citations = streams.agentMessageCitations.get(item.id);
         streams.agentMessageCitations.delete(item.id);
-        const text = citations ? citations.flush() : renderFileCitations(item.text, this.sessionState.cwd);
+        const suffix = missingTextSuffix(this.emittedAgentMessageText.get(`${threadId}:${item.id}`) ?? "", item.text, true);
+        this.emittedAgentMessageText.delete(`${threadId}:${item.id}`);
+        const text = citations ? citations.push(suffix) + citations.flush() : renderFileCitations(suffix, this.sessionState.cwd);
         return this.createAgentMessageText(text, item.id, threadId);
     }
 
     private createAgentMessageText(text: string, itemId: string, threadId: string): UpdateSessionEvent | null {
         if (text.length === 0) return null;
         const phase = this.streamsFor(threadId).agentMessagePhases.get(itemId) ?? null;
-        const meta = createMessagePhaseMeta(phase, this.sessionState.clientCapabilities.airClient);
+        const meta = createCodexMessageMeta(
+            phase, this.agentMessageMetadata.get(`${threadId}:${itemId}`)?.memoryCitation, this.sessionState.clientCapabilities.airClient,
+        );
         return createAgentTextMessageChunk(text, itemId, meta);
     }
 
@@ -876,6 +1064,132 @@ export class CodexEventHandler {
         return createAgentTextMessageChunk(`Warning: ${event.message}\n\n`);
     }
 
+    private createGuardianWarningEvent(event: GuardianWarningNotification): UpdateSessionEvent {
+        return createAgentTextMessageChunk(
+            `Guardian warning: ${event.message}\n\n`,
+            this.nextStandaloneMessageId("guardian-warning"),
+        );
+    }
+
+    private createFileChangePatchEvent(event: FileChangePatchUpdatedNotification): UpdateSessionEvent {
+        return this.renderer.render({
+            ...FileChangeReporter.started({
+                type: "fileChange", id: event.itemId, status: "inProgress", changes: event.changes,
+            }, this.sessionState.clientCapabilities.diffPatchFormat),
+            report: "update",
+        });
+    }
+
+    private createHookStartedEvent(event: HookStartedNotification): UpdateSessionEvent {
+        this.emittedToolCallIds.add(`${event.threadId}:hook:${event.run.id}`);
+        return {
+            sessionUpdate: "tool_call",
+            toolCallId: `hook:${event.run.id}`,
+            kind: "other",
+            title: `Hook: ${event.run.eventName}`,
+            status: "in_progress",
+            rawInput: this.hookRawData(event.run),
+            content: this.hookContent(event.run.entries),
+        };
+    }
+
+    private createHookCompletedEvent(event: HookCompletedNotification): UpdateSessionEvent {
+        const toolCallId = `hook:${event.run.id}`;
+        const hadStart = this.emittedToolCallIds.delete(`${event.threadId}:${toolCallId}`);
+        if (hadStart) {
+            return {
+                sessionUpdate: "tool_call_update",
+                toolCallId,
+                status: event.run.status === "completed" ? "completed" : "failed",
+                rawOutput: this.hookRawData(event.run),
+                content: this.hookContent(event.run.entries),
+            };
+        }
+        return {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            kind: "other",
+            title: `Hook: ${event.run.eventName}`,
+            status: event.run.status === "completed" ? "completed" : "failed",
+            rawOutput: this.hookRawData(event.run),
+            content: this.hookContent(event.run.entries),
+        };
+    }
+
+    private hookRawData(run: HookStartedNotification["run"]): Record<string, unknown> {
+        return {
+            eventName: run.eventName,
+            handlerType: run.handlerType,
+            executionMode: run.executionMode,
+            scope: run.scope,
+            source: run.source,
+            sourcePath: run.sourcePath,
+            status: run.status,
+            statusMessage: run.statusMessage,
+            durationMs: run.durationMs?.toString() ?? null,
+        };
+    }
+
+    private hookContent(entries: HookStartedNotification["run"]["entries"]): Array<{
+        type: "content";
+        content: {type: "text"; text: string};
+    }> {
+        return entries.map(entry => ({
+            type: "content",
+            content: {type: "text", text: `${entry.kind}: ${entry.text}`},
+        }));
+    }
+
+    private createRealtimeTranscriptDeltaEvent(event: ThreadRealtimeTranscriptDeltaNotification): UpdateSessionEvent {
+        const transcript = this.realtimeTranscripts.get(event.role) ?? {
+            messageId: this.nextStandaloneMessageId(`realtime-${event.role}`),
+            text: "",
+        };
+        transcript.text += event.delta;
+        this.realtimeTranscripts.set(event.role, transcript);
+        return event.role === "user"
+            ? createUserMessageChunk({type: "text", text: event.delta}, transcript.messageId)
+            : createAgentTextMessageChunk(event.delta, transcript.messageId);
+    }
+
+    private createRealtimeTranscriptDoneEvent(event: ThreadRealtimeTranscriptDoneNotification): UpdateSessionEvent | null {
+        const transcript = this.realtimeTranscripts.get(event.role);
+        this.realtimeTranscripts.delete(event.role);
+        const messageId = transcript?.messageId ?? this.nextStandaloneMessageId(`realtime-${event.role}`);
+        const suffix = missingTextSuffix(transcript?.text ?? "", event.text, true);
+        if (suffix.length === 0) {
+            return null;
+        }
+        return event.role === "user"
+            ? createUserMessageChunk({type: "text", text: suffix}, messageId)
+            : createAgentTextMessageChunk(suffix, messageId);
+    }
+
+    private createRealtimeAudioEvent(audio: ThreadRealtimeAudioChunk): UpdateSessionEvent {
+        const messageId = audio.itemId
+            ?? this.realtimeAudioMessageId
+            ?? this.nextStandaloneMessageId("realtime-audio");
+        this.realtimeAudioMessageId = messageId;
+        return createAgentMessageChunk({
+            type: "audio",
+            data: audio.data,
+            mimeType: `audio/pcm;rate=${audio.sampleRate};channels=${audio.numChannels}`,
+            _meta: {
+                codex: {
+                    sampleRate: audio.sampleRate,
+                    numChannels: audio.numChannels,
+                    samplesPerChannel: audio.samplesPerChannel,
+                    itemId: audio.itemId,
+                },
+            },
+        }, messageId);
+    }
+
+    private nextStandaloneMessageId(kind: string): string {
+        this.standaloneMessageSequence += 1;
+        return `${kind}:${this.standaloneMessageSequence}`;
+    }
+
     private createModelReroutedEvent(event: ModelReroutedNotification): UpdateSessionEvent {
         if (!this.supportsNotices) {
             return createAgentTextThoughtChunk(`Model rerouted from ${event.fromModel} to ${event.toModel} (${event.reason}).\n\n`);
@@ -909,15 +1223,40 @@ export class CodexEventHandler {
     }
 
     private createReasoningDeltaEvent(
-        event: ReasoningSummaryTextDeltaNotification | ReasoningTextDeltaNotification
-    ): UpdateSessionEvent {
-        this.streamsFor(event.threadId).seenReasoningDeltaItemIds.add(event.itemId);
-        return this.createAgentThoughtEvent(event.delta, event.itemId);
+        event: ReasoningSummaryTextDeltaNotification | ReasoningTextDeltaNotification,
+        kind: "summary" | "raw",
+    ): UpdateSessionEvent | null {
+        if (this.completedItemIds.has(`${event.threadId}:${event.itemId}`)) {
+            return null;
+        }
+        const pending = kind === "summary"
+            ? this.snapshotPendingReasoningSummaryText
+            : this.snapshotPendingReasoningRawText;
+        const emitted = kind === "summary"
+            ? this.emittedReasoningSummaryText
+            : this.emittedReasoningRawText;
+        const delta = this.reconcileSnapshotDelta(pending, `${event.threadId}:${event.itemId}`, event.delta);
+        if (delta.length === 0) {
+            return null;
+        }
+        this.appendEmittedText(emitted, `${event.threadId}:${event.itemId}`, delta);
+        return this.createAgentThoughtEvent(delta, event.itemId);
     }
 
-    private createReasoningSectionBreakEvent(event: ReasoningSummaryPartAddedNotification): UpdateSessionEvent {
-        this.streamsFor(event.threadId).seenReasoningDeltaItemIds.add(event.itemId);
-        return this.createAgentThoughtEvent("\n\n", event.itemId);
+    private createReasoningSectionBreakEvent(event: ReasoningSummaryPartAddedNotification): UpdateSessionEvent | null {
+        if (this.completedItemIds.has(`${event.threadId}:${event.itemId}`)) {
+            return null;
+        }
+        const delta = this.reconcileSnapshotDelta(
+            this.snapshotPendingReasoningSummaryText,
+            `${event.threadId}:${event.itemId}`,
+            "\n\n",
+        );
+        if (delta.length === 0) {
+            return null;
+        }
+        this.appendEmittedText(this.emittedReasoningSummaryText, `${event.threadId}:${event.itemId}`, delta);
+        return this.createAgentThoughtEvent(delta, event.itemId);
     }
 
     private createAgentThoughtEvent(text: string, messageId: string): UpdateSessionEvent {
@@ -925,6 +1264,11 @@ export class CodexEventHandler {
     }
 
     private async createItemEvent(event: ItemStartedNotification): Promise<UpdateSessionEvent | null> {
+        if (this.startedItemIds.has(`${event.threadId}:${event.item.id}`)) {
+            return null;
+        }
+        this.startedItemIds.add(`${event.threadId}:${event.item.id}`);
+        this.emittedToolCallIds.add(`${event.threadId}:${event.item.id}`);
         switch (event.item.type) {
             case "fileChange":
                 return this.renderer.render(FileChangeReporter.started(
@@ -948,7 +1292,7 @@ export class CodexEventHandler {
             case "collabAgentToolCall":
                 return this.renderer.render(this.subagents.legacyCollaborationStarted(event.item));
             case "agentMessage":
-                this.rememberAgentMessagePhase(event.item, event.threadId);
+                this.rememberAgentMessage(event.item, event.threadId);
                 return null;
             case "contextCompaction":
                 return this.supportsCompaction
@@ -972,11 +1316,21 @@ export class CodexEventHandler {
     }
 
     private async completeItemEvent(event: ItemCompletedNotification): Promise<UpdateSessionEvent | null> {
+        if (this.completedItemIds.has(`${event.threadId}:${event.item.id}`)) {
+            return null;
+        }
+        this.completedItemIds.add(`${event.threadId}:${event.item.id}`);
+        this.snapshotPendingAgentText.delete(`${event.threadId}:${event.item.id}`);
+        this.snapshotPendingReasoningSummaryText.delete(`${event.threadId}:${event.item.id}`);
+        this.snapshotPendingReasoningRawText.delete(`${event.threadId}:${event.item.id}`);
+        const hadStart = this.emittedToolCallIds.delete(`${event.threadId}:${event.item.id}`);
         switch (event.item.type) {
             case "fileChange":
                 return this.renderer.render(FileChangeReporter.completed(event.item));
             case "dynamicToolCall":
-                return this.renderer.render(DynamicToolReporter.completed(event.item));
+                return this.renderer.render(hadStart
+                    ? DynamicToolReporter.completed(event.item)
+                    : DynamicToolReporter.started(event.item));
             case "mcpToolCall":
                 return this.renderer.render(McpToolReporter.completed(event.item));
             case "commandExecution":
@@ -991,17 +1345,16 @@ export class CodexEventHandler {
                     ? ImageGenerationReporter.completed(event.item)
                     : ImageGenerationReporter.whole(event.item));
             case "reasoning":
-                if (this.streamsFor(event.threadId).seenReasoningDeltaItemIds.delete(event.item.id)) {
-                    return null;
-                }
-                return this.createCompletedReasoningEvent(event.item);
+                return this.createCompletedReasoningEvent(event.item, event.threadId);
             case "webSearch":
                 return this.renderer.render(WebSearchReporter.completed(event.item));
             case "collabAgentToolCall":
                 return this.renderer.render(this.subagents.legacyCollaborationCompleted(event.item));
             case "agentMessage":
-                this.rememberAgentMessagePhase(event.item, event.threadId);
-                return this.flushAgentMessageText(event.item, event.threadId);
+                this.rememberAgentMessage(event.item, event.threadId);
+                const update = this.flushAgentMessageText(event.item, event.threadId);
+                this.agentMessageMetadata.delete(`${event.threadId}:${event.item.id}`);
+                return update;
             case "plan":
                 return await this.createCompletedPlanEvent(event.item);
             case "exitedReviewMode":
@@ -1030,17 +1383,89 @@ export class CodexEventHandler {
             ? this.subagents.itemStreams(threadId) ?? this.itemStreams : this.itemStreams;
     }
 
-    private rememberAgentMessagePhase(item: ThreadItem & { type: "agentMessage" }, threadId: string): void {
+    private rememberAgentMessage(item: ThreadItem & { type: "agentMessage" }, threadId: string): void {
         this.streamsFor(threadId).agentMessagePhases.set(item.id, item.phase);
+        this.agentMessageMetadata.set(`${threadId}:${item.id}`, {
+            phase: item.phase,
+            memoryCitation: item.memoryCitation,
+        });
     }
 
-    private createCompletedReasoningEvent(item: ThreadItem & { type: "reasoning" }): UpdateSessionEvent | null {
-        const parts = item.summary.length > 0 ? item.summary : item.content;
-        const text = parts.filter(part => part.length > 0).join("\n\n");
-        if (text.length === 0) {
+    private createCompletedReasoningEvent(item: ThreadItem & { type: "reasoning" }, threadId: string): UpdateSessionEvent | null {
+        const hasSummary = item.summary.some(part => part.length > 0);
+        const text = hasSummary ? this.reasoningSummaryText(item) : this.reasoningRawText(item);
+        const emitted = hasSummary
+            ? this.emittedReasoningSummaryText.get(`${threadId}:${item.id}`) ?? ""
+            : this.emittedReasoningRawText.get(`${threadId}:${item.id}`) ?? "";
+        const suffix = missingTextSuffix(emitted, text);
+        this.emittedReasoningSummaryText.delete(`${threadId}:${item.id}`);
+        this.emittedReasoningRawText.delete(`${threadId}:${item.id}`);
+        if (suffix.length === 0) {
             return null;
         }
-        return this.createAgentThoughtEvent(text, item.id);
+        return this.createAgentThoughtEvent(suffix, item.id);
+    }
+
+    private reasoningSummaryText(item: ThreadItem & {type: "reasoning"}): string {
+        return item.summary.filter(part => part.length > 0).join("\n\n");
+    }
+
+    private reasoningRawText(item: ThreadItem & {type: "reasoning"}): string {
+        return item.content.filter(part => part.length > 0).join("\n\n");
+    }
+
+    private appendEmittedText(target: Map<string, string>, itemId: string, text: string): void {
+        target.set(itemId, `${target.get(itemId) ?? ""}${text}`);
+    }
+
+    private reconcileSnapshotDelta(target: Map<string, string>, itemId: string, delta: string): string {
+        const pending = target.get(itemId);
+        if (pending === undefined) {
+            return delta;
+        }
+        if (pending.startsWith(delta)) {
+            const remaining = pending.slice(delta.length);
+            if (remaining.length === 0) {
+                target.delete(itemId);
+            } else {
+                target.set(itemId, remaining);
+            }
+            return "";
+        }
+        if (delta.startsWith(pending)) {
+            target.delete(itemId);
+            return delta.slice(pending.length);
+        }
+
+        let overlap = Math.min(pending.length, delta.length);
+        while (overlap > 0 && !pending.endsWith(delta.slice(0, overlap))) {
+            overlap -= 1;
+        }
+        target.delete(itemId);
+        return delta.slice(overlap);
+    }
+
+    private observeReviewMode(item: ThreadItem, threadId: string, turnId: string): void {
+        if (item.type === "enteredReviewMode") this.reviewTurnIds.add(`${threadId}:${turnId}`);
+        else if (item.type === "exitedReviewMode") this.reviewTurnIds.delete(`${threadId}:${turnId}`);
+    }
+
+    private createUserMessageEvents(item: Extract<ThreadItem, {type: "userMessage"}>, threadId: string, turnId: string): UpdateSessionEvent[] {
+        if (this.renderedUserMessageItemIds.has(`${threadId}:${item.id}`)) {
+            return [];
+        }
+        this.startedItemIds.add(`${threadId}:${item.id}`);
+        this.renderedUserMessageItemIds.add(`${threadId}:${item.id}`);
+        if (item.clientId && this.pendingLocalUserMessageIds.delete(item.clientId)) {
+            return [];
+        }
+        // Codex's own reviewer prompt is internal; v1 retains its existing transcript contract.
+        if (this.session.protocolVersion === 2 && item.clientId === null && this.reviewTurnIds.has(`${threadId}:${turnId}`)) {
+            return [];
+        }
+        return item.content.flatMap(input =>
+            userInputToContentBlocks(input).map(block => createUserMessageChunk(block, item.id))
+        );
     }
 
     private async createCompletedPlanEvent(item: ThreadItem & { type: "plan" }): Promise<UpdateSessionEvent | null> {
@@ -1055,7 +1480,7 @@ export class CodexEventHandler {
         if (text.length === 0) {
             return null;
         }
-        return createAgentTextMessageChunk(text);
+        return createAgentTextMessageChunk(text, item.id);
     }
 
     private createContextCompactedEvent(): UpdateSessionEvent {
@@ -1401,4 +1826,25 @@ function isModelOutputItem(item: ThreadItem): boolean {
 function toolCallTitle(update: UpdateSessionEvent | null | undefined): string | undefined {
     if (update?.sessionUpdate !== "tool_call") return undefined;
     return update.title;
+}
+
+function missingTextSuffix(emitted: string, completed: string, preserveRevision = false): string {
+    if (emitted.length === 0) {
+        return completed;
+    }
+    if (completed.startsWith(emitted)) {
+        return completed.slice(emitted.length);
+    }
+    if (emitted.endsWith(completed)) {
+        return "";
+    }
+
+    let overlap = Math.min(emitted.length, completed.length);
+    while (overlap > 0 && !emitted.endsWith(completed.slice(0, overlap))) {
+        overlap -= 1;
+    }
+    if (overlap > 0) {
+        return completed.slice(overlap);
+    }
+    return preserveRevision ? `\n\n${completed}` : "";
 }

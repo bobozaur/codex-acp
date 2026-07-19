@@ -3,6 +3,7 @@ import {finished, Readable, Writable} from "node:stream";
 import {Emitter} from "vscode-jsonrpc/node";
 import type {DataCallback, Disposable, Message, MessageReader, MessageWriter, PartialMessageInfo} from "vscode-jsonrpc/node";
 import * as acp from "@agentclientprotocol/sdk/unstable";
+import {tagAppServerRequest} from "./AppServerRequestContext";
 import {logger} from "./Logger";
 
 //TODO ask to include proper jsonrpc field and remove
@@ -53,6 +54,11 @@ export function createJSONRPCReader(readable: Readable): MessageReader & {delive
                 }
                 if (msg && typeof msg === 'object' && (msg as {jsonrpc?: unknown}).jsonrpc === undefined) {
                     (msg as {jsonrpc: string}).jsonrpc = '2.0';
+                }
+                const candidate = msg as {id?: unknown, method?: unknown, params?: unknown};
+                if (candidate && typeof candidate.method === "string"
+                    && (typeof candidate.id === "string" || typeof candidate.id === "number")) {
+                    tagAppServerRequest(candidate.params, candidate.id);
                 }
                 callback(msg as Message);
             };

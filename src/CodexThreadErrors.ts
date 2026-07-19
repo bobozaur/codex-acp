@@ -87,6 +87,34 @@ export function parseExpectedActiveTurnMismatch(err: unknown): {expected: string
     return match ? {expected: match[1]!, found: match[2]!} : null;
 }
 
+export type ActiveTurnSteerRace =
+    | {type: "missing"}
+    | {type: "mismatch", actualTurnId: string};
+
+/** Active-turn steering can race completion or replacement by a new turn. */
+export function parseActiveTurnSteerRace(err: unknown): ActiveTurnSteerRace | null {
+    const messages = [errorText(err)];
+    if (typeof err === "object" && err !== null && "data" in err) {
+        const data = (err as {data?: unknown}).data;
+        if (typeof data === "string") {
+            messages.push(data);
+        } else if (typeof data === "object" && data !== null && "details" in data
+            && typeof data.details === "string") {
+            messages.push(data.details);
+        }
+    }
+    for (const message of messages) {
+        if (message.toLowerCase().includes("no active turn to steer")) return {type: "missing"};
+        const match = /expected active turn id `?([^\s`]+)`? but found `?([^\s`]+)`?/.exec(message);
+        if (match) return {type: "mismatch", actualTurnId: match[2]!};
+    }
+    return null;
+}
+
+export function isNoActiveTurnToSteerError(err: unknown): boolean {
+    return parseActiveTurnSteerRace(err)?.type === "missing";
+}
+
 /**
  * True when the error means "Codex has no persisted thread under this id" for
  * any reason -- unparseable id, unknown id, or an id whose rollout was never

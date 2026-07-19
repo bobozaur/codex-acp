@@ -5,7 +5,7 @@ import path from "node:path";
 import {Readable, Writable} from "node:stream";
 import {expect, vi} from "vitest";
 import {ModelId} from "../../../ModelId";
-import {removeDirectoryWithRetry, writeCodexHomeConfig} from "../../acp-test-utils";
+import {removeDirectoryWithRetry, stopTestCodexDaemon, writeCodexHomeConfig} from "../../acp-test-utils";
 import type {PermissionResponder} from "./permission-responders";
 import type {LegacyNewSessionResponse} from "../../../AcpExtensions";
 
@@ -303,6 +303,7 @@ class SpawnedAgentFixtureImpl implements SpawnedAgentFixture {
         }
         this.disposed = true;
         await this.stopProcess(true);
+        await stopTestCodexDaemon(this.paths.codexHome, {...process.env, ...this.extraEnv});
         removeDirectoryWithRetry(this.paths.rootDir);
     }
 
