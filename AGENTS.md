@@ -40,7 +40,7 @@
 - Cover both ACP v1 and v2 when a change affects what a client receives (updates, responses, replay). A change to internal logic only does not need its tests duplicated per version.
 - Before adding a test, search for existing tests of the same API and scenario. Don't add cases that take the same code path. Tests that differ only in input belong in one `it.each`. Don't repeat a unit test's assertion in a wire/router test unless the wire level checks something more.
 - For each behavior the docs promise, including what is omitted or rejected, have a test that would fail if it broke.
-- Use `/run-codex` skill (`.claude/skills/run-codex/`) to test with real Codex and observe actual events.
+- Use `npm run test:e2e` for real Codex integration tests and `npm run test:remote-sync` for shared-daemon synchronization.
 
 ## Pull Requests
 
