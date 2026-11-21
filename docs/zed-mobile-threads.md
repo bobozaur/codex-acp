@@ -1,6 +1,6 @@
 # Add Codex Android conversations to the stock Zed sidebar
 
-Zed's thread archive has an **Import Threads** action for the Codex agent. Imported conversations start in the archive. Opening one restores it to the project sidebar. [Zed's ACP import](https://github.com/zed-industries/zed/blob/d01b134cddf5e4f71964deb2d6f81cdb38fcf1e7/crates/agent_ui/src/thread_import.rs#L794-L889)
+While Zed is running, open the thread archive, click **Import Threads** (the download icon), select your Codex agent, and confirm. For a conversation on an SSH host, open a Zed workspace connected to that host first. Open the imported conversation from the archive to add it to its project sidebar. [Zed’s thread importer](https://github.com/zed-industries/zed/blob/d01b134cddf5e4f71964deb2d6f81cdb38fcf1e7/crates/agent_ui/src/thread_import.rs#L641-L719), [archive action](https://github.com/zed-industries/zed/blob/d01b134cddf5e4f71964deb2d6f81cdb38fcf1e7/crates/agent_ui/src/threads_archive_view.rs#L584-L594)
 
 `scripts/zed-mobile-threads.py` can add missing Android conversations directly to the project sidebar at startup. It uses the original Codex session IDs, so opening an entry resumes the existing conversation through the configured agent. The tool requires Python 3 with its standard `sqlite3` module and targets the sidebar schema used by Zed 1.29.3 stable.
 
@@ -8,7 +8,9 @@ Choose one native Codex session ID that is already present in the desktop's Zed 
 
 ## Run before opening Zed
 
-Zed reads the persisted sidebar into memory at startup. Run the importer before starting Zed to see the entries at that launch. Each new entry gets its own Zed ID and project path with the same local or SSH connection as the reference. Existing entries keep their titles, archive flags, and routing.
+Zed 1.29.3 reads its sidebar database when the editor starts. Opening another window uses the same in-memory list. Run the external importer with Zed fully closed so the sidebar and the built-in importer both see the new entries on launch. [Zed’s sidebar cache](https://github.com/zed-industries/zed/blob/d01b134cddf5e4f71964deb2d6f81cdb38fcf1e7/crates/agent_ui/src/thread_metadata_store.rs#L659-L696)
+
+Each new entry gets its own Zed ID and project path with the same local or SSH connection as the reference. Existing entries keep their titles, archive flags, and routing.
 
 On a host that runs both Codex and Zed, replace the example UUID with your reference ID. Use `--dry-run` on the import first to see the count. Remove `--dry-run` to add the entries.
 
@@ -27,17 +29,21 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 codex-host \
   | python3 "$HOME/bin/zed-mobile-threads.py" import
 ```
 
-For automatic imports, save the following as a separate executable named `zed-with-mobile-threads`. Point your desktop launcher's command at it and keep the original Zed arguments. The wrapper starts Zed even when SSH or the import fails.
+For automatic imports from a Linux desktop launcher, save the following as a separate executable named `zed-with-mobile-threads`. Set `stock_zed` to the original stable Zed CLI. Point the desktop launcher's command at the wrapper and keep its original arguments. Opening a file or a new window while Zed is running goes straight to the editor. If SSH or the import fails, Zed still starts.
 
 ```bash
 #!/usr/bin/env bash
 set -o pipefail
-if ! ssh -o BatchMode=yes -o ConnectTimeout=5 codex-host \
+stock_zed="$HOME/.local/zed.app/bin/zed"
+if pgrep -u "$(id -u)" -x zed-editor >/dev/null; then
+  exec "$stock_zed" "$@"
+fi
+if ! timeout 8s ssh -o BatchMode=yes -o ConnectTimeout=5 codex-host \
   'python3 "$HOME/bin/zed-mobile-threads.py" export f83538cf-01e3-4c75-8c56-41e233222b55' \
   | python3 "$HOME/bin/zed-mobile-threads.py" import; then
   printf '%s\n' 'Could not refresh Codex Android threads. Starting Zed.' >&2
 fi
-exec zed "$@"
+exec "$stock_zed" "$@"
 ```
 
 ## Database and snapshot scope
