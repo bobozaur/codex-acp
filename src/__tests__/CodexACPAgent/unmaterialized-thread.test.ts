@@ -53,6 +53,7 @@ function createFixture() {
     client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
     client.listSkills = vi.fn().mockResolvedValue({data: []});
     appServer.listModels = vi.fn().mockResolvedValue({data: [createTestModel()], nextCursor: null});
+    appServer.threadRead = vi.fn().mockResolvedValue({thread: createLiveThread()});
     return {fixture, client, appServer};
 }
 
@@ -154,20 +155,19 @@ describe("sessions Codex has not materialized on disk", () => {
             sessionId: threadId,
             cwd: "/test/cwd",
             mcpServers: [],
-        })).rejects.toThrow("no rollout found for thread id");
+        })).rejects.toThrow("thread not loaded:");
+        expect(appServer.threadResume).not.toHaveBeenCalled();
     });
 
     it("does not swallow an unrelated thread/resume failure", async () => {
         const {fixture, appServer} = createFixture();
         appServer.threadResume = vi.fn().mockRejectedValue(new Error("codex app-server transport closed"));
-        appServer.threadRead = vi.fn();
-
         await expect(fixture.getCodexAcpAgent().resumeSession({
             sessionId: threadId,
             cwd: "/test/cwd",
             mcpServers: [],
         })).rejects.toThrow("transport closed");
-        expect(appServer.threadRead).not.toHaveBeenCalled();
+        expect(appServer.threadRead).toHaveBeenCalledExactlyOnceWith({threadId, includeTurns: false});
     });
 
     it("deletes a session that has no persisted rollout", async () => {

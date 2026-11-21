@@ -1,7 +1,7 @@
 import {ConnectionError, ConnectionErrors, ErrorCodes, ResponseError} from "vscode-jsonrpc/node";
 import type {CodexAcpClient} from "../CodexAcpClient";
 import type {CodexConnection} from "../CodexJsonRpcConnection";
-import {isMissingRolloutError} from "../CodexThreadErrors";
+import {isMissingRolloutError, isThreadNotLoadedError} from "../CodexThreadErrors";
 import {logger} from "../Logger";
 import {
     type AppServerExit,
@@ -675,7 +675,7 @@ export class AppServerRecovery<S extends RecoverableSession> {
         if (isAppServerUnavailableError(error)) return error;
         const mapped = this.mapError(error, client);
         if (mapped !== error) return mapped;
-        if (isMissingRolloutError(error)) {
+        if (isMissingRolloutError(error) || isThreadNotLoadedError(error)) {
             return new UnpersistedSessionLostError(sessionId);
         }
         const message = error instanceof Error ? error.message : String(error);

@@ -493,6 +493,21 @@ describe("session/list", () => {
         }
     });
 
+    it("keeps one row for a session captured by both lists during an archive move", async () => {
+        const {agent, threadList} = await createAgent("sessionIndex");
+        const moved = createThread({id: "moving", recencyAt: 20});
+        const other = createThread({id: "other", recencyAt: 10});
+        threadList.mockImplementation(async ({archived}) => ({
+            data: archived ? [moved, other] : [moved], nextCursor: null, backwardsCursor: null,
+        }));
+
+        const response = await agent.listSessions({_meta: {jetbrains: {air: {list: {archived: "all", limit: 2}}}}});
+
+        expect(response.sessions.map(session => [session.sessionId, (session._meta as any).jetbrains.air.archived]))
+            .toEqual([["moving", false], ["other", true]]);
+        expect(response.nextCursor).toBeNull();
+    });
+
     it("stops a sparse relative cwd scan after its time budget with a cursor to continue", async () => {
         const {agent, threadList} = await createAgent("sessionIndex");
         let page = 0;
@@ -619,7 +634,7 @@ describe("session/list", () => {
             limit: 100,
             sortKey: "recency_at",
             archived: false,
-            sourceKinds: [],
+            sourceKinds: ["cli", "vscode", "appServer", "unknown"],
             modelProviders: [],
             useStateDbOnly: true,
         })));
@@ -639,6 +654,30 @@ describe("session/list", () => {
         expect([first, second].map(page => page.sessions.map(session => session.sessionId))).toEqual([["a", "b"], ["c", "d"]]);
         expect(second.nextCursor).toBeNull();
         expect(threadList.mock.calls.map(call => call[0].cursor)).toEqual([null, null, "codex-2"]);
+    });
+
+    it("paginates an imported absolute cwd across equivalent path spellings", async () => {
+        const {agent, threadList} = await createAgent("sessionIndex");
+        threadList.mockImplementation(async ({cursor}) => ({
+            data: cursor === null
+                ? [createThread({id: "same-basename", cwd: "Z:/other/Project", recencyAt: 30}),
+                    createThread({id: "first", cwd: "Z:\\Retained\\Project\\", recencyAt: 20})]
+                : [createThread({id: "second", cwd: "z:/retained/project", recencyAt: 10})],
+            nextCursor: cursor === null ? "older" : null,
+            backwardsCursor: null,
+        }));
+        const list = (cwd: string, cursor: string | null) => agent.listSessions({
+            cwd, cursor, _meta: {jetbrains: {air: {list: {limit: 1, includeWorktrees: true}}}},
+        });
+
+        const first = await list("Z:\\Retained\\Project", null);
+        expect(first.nextCursor).not.toBeNull();
+        await expect(list("Z:/other/project", first.nextCursor ?? null)).rejects.toMatchObject({code: -32602});
+        const second = await list("z:/retained/project/", first.nextCursor ?? null);
+
+        expect([first, second].map(page => page.sessions.map(session => session.sessionId))).toEqual([["first"], ["second"]]);
+        expect(second.nextCursor).toBeNull();
+        expect(threadList.mock.calls.map(([params]) => [params.cwd, params.limit])).toEqual([[undefined, 100], [undefined, 100]]);
     });
 
     it("filters the archived Codex list for a relative cwd with archived: \"archived\"", async () => {
@@ -1355,8 +1394,8 @@ describe("_session/batch_get", () => {
         const {agent, threadList, read, root} = await setup(recent);
         const {repo, worktrees: [worktree]} = createGitLayout(root, ["worktree"]);
         fs.writeFileSync(path.join(repo, ".git", "worktrees", "worktree", "codex-thread.json"), "{}");
-        const old = createThread({id: threadId, name: "Old session", recencyAt: 10, status: {type: "active", activeFlags: []}});
-        const archived = createThread({id: "archived", name: "Archived", path: path.join(root, "archived_sessions", "rollout.jsonl"), recencyAt: 5});
+        const old = createThread({id: threadId, name: "Old session", source: "appServer", recencyAt: 10, status: {type: "active", activeFlags: []}});
+        const archived = createThread({id: "archived", name: "Archived", source: "unknown", path: path.join(root, "archived_sessions", "rollout.jsonl"), recencyAt: 5});
         const linked = createThread({id: "worktree", cwd: worktree!, name: "Worktree", recencyAt: 1});
         const rows = [old, archived, linked];
         const list = await agent.listSessions({});
@@ -1398,6 +1437,7 @@ describe("_session/batch_get", () => {
     it.each([
         {ephemeral: true},
         {source: "exec"},
+        {source: {custom: "another-app"}},
         {source: {subAgent: "review"}},
         {preview: ""},
         {path: null},

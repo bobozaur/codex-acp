@@ -15,6 +15,7 @@ import type {ServerNotification} from "./app-server";
 import type {Thread, ThreadListParams, ThreadListResponse, ThreadStatus, Turn} from "./app-server/v2";
 import {AIR_META_KEY, JETBRAINS_META_KEY, withAirMeta} from "./AirExtension";
 import {listedSessionTitle} from "./SessionTitle";
+import {hasSessionListSource, SESSION_LIST_SOURCE_KINDS} from "./SessionListSources";
 import {isArchivedRolloutPath} from "./SessionIndexMutations";
 import {logger} from "./Logger";
 
@@ -89,26 +90,13 @@ export interface SessionIndexThread {
     archived: boolean;
 }
 
-/** The sources that `thread/list` lists without `sourceKinds`: the CLI and the IDE extensions, as AIR. */
-export function isInteractiveSource(thread: Thread): boolean {
-    return thread.source === "cli" || thread.source === "vscode";
-}
-
 /**
- * Whether `thread/list` lists a thread that `thread/read` returned: one that is not ephemeral, from an
- * interactive source, with a first user message, which is its `preview`.
- */
-export function isListedThread(thread: Thread): boolean {
-    return !thread.ephemeral && isInteractiveSource(thread) && thread.preview !== "" && thread.path !== null;
-}
-
-/**
- * The entry of a `thread/read` result, or null when `session/list` would not show the thread. Codex reports the
- * archive state only through the rollout path.
+ * A `thread/read` result eligible for a session-index row. Codex reports the archive state only through
+ * the rollout path.
  */
 export function listedThreadEntry(thread: Thread, codexHome: string | null): SessionIndexThread | null {
-    if (!isListedThread(thread)) return null;
-    return {thread, archived: thread.path !== null && isArchivedRolloutPath(thread.path, codexHome)};
+    if (thread.ephemeral || !hasSessionListSource(thread) || thread.preview === "" || thread.path === null) return null;
+    return {thread, archived: isArchivedRolloutPath(thread.path, codexHome)};
 }
 
 export type SessionActivityState = "running" | "idle" | "requires_action" | "reviewing" | "error";
@@ -194,8 +182,7 @@ function readLimit(value: unknown): number {
  *
  * - `cwd` is the cwd and its worktrees, see `linkedWorktreeCwds`, or no filter when the client sent no cwd.
  *   A single cwd goes as a string, as the Codex TUI sends it.
- * - `sourceKinds: []` means the interactive sources, as in the Codex TUI and the Codex app. It leaves out
- *   `codex exec` runs and subagent threads.
+ * - Use the standard ACP session sources, including older sessions recorded with an unknown source.
  * - `modelProviders: []` means all providers, whatever login the agent has.
  * - `useStateDbOnly` answers from the state DB. Without it, Codex scans and repairs every rollout file.
  */
@@ -210,7 +197,7 @@ export function sessionIndexThreadListParams(
         limit,
         sortKey: "recency_at",
         archived,
-        sourceKinds: [],
+        sourceKinds: [...SESSION_LIST_SOURCE_KINDS],
         modelProviders: [],
         ...(cwds === null ? {} : {cwd: cwds.length === 1 ? cwds[0]! : cwds}),
         useStateDbOnly: true,
@@ -325,6 +312,7 @@ export async function readSessionIndexPage(
 
     // A filtered list gathers rows from several Codex pages to fill the page: its matches can be sparse.
     const collected: SessionIndexThread[] = [];
+    const collectedIds = new Set<string>();
     const startedAt = Date.now();
     const answer = (): {threads: SessionIndexThread[], nextCursor: string | null} => ({
         threads: collected,
@@ -375,12 +363,18 @@ export async function readSessionIndexPage(
             .map(thread => ({thread, archived: sideArchived(index), index})));
         // A stable sort: rows as recent as each other keep the Codex order, unarchived first.
         candidates.sort((left, right) => recencyOf(right.thread) - recencyOf(left.thread));
-        const taken = candidates.slice(0, options.limit - collected.length);
-        const takenIds = new Set(taken.map(row => row.thread.id));
+        const taken: typeof candidates = [];
+        for (const row of candidates) {
+            // An archive or unarchive can put the same thread in both responses.
+            if (collectedIds.has(row.thread.id)) continue;
+            collectedIds.add(row.thread.id);
+            taken.push(row);
+            if (collected.length + taken.length === options.limit) break;
+        }
 
         // A Codex page whose rows the client now has, or which had none to give, is done with.
         for (const [index, page] of [...pages]) {
-            const allTaken = (page.oldest === null || page.oldest >= bound) && page.rows.every(row => takenIds.has(row.id));
+            const allTaken = (page.oldest === null || page.oldest >= bound) && page.rows.every(row => collectedIds.has(row.id));
             if (!allTaken) continue;
             pages.delete(index);
             advanceSide(index, page.nextCursor);

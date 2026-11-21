@@ -292,6 +292,12 @@ AIR gets the output of a command that shows a terminal in `_meta.terminal_output
 It gets the output of a read, search, or list command once, as `rawOutput` text at the end.
 AIR stores `rawOutput` text as an output stream and moves a large one to a file.
 
+During history replay, Zed gets one final tool report for a finished read, search, or list command when its
+output goes to `content`. Replayed image views have an empty `locations` list and use a resource link with a
+file URI for an absolute path, so Zed can open the image on demand. The [replay file map](../readme-dev.md#runtime-environment)
+can replace the link target or mark it unavailable. Unavailable images and images without a usable path show
+the recorded path as text.
+
 This adapter offers no `terminal-auth` authentication method.
 
 ## Tool call contract
@@ -1046,20 +1052,21 @@ The request can carry `_meta.jetbrains.air.list`:
     gone is left out. The worktrees of a bare repository count too; the primary checkout is added only when there
     is one. Each row reports its own real `cwd`.
 - The adapter sends `thread/list`
-  `{cwd, limit, sortKey: "recency_at", archived, sourceKinds: [], modelProviders: [], useStateDbOnly: true, cursor}`.
+  `{cwd, limit, sortKey: "recency_at", archived, sourceKinds: ["cli", "vscode", "appServer", "unknown"], modelProviders: [], useStateDbOnly: true, cursor}`.
   - `cwd` is a string for a single path and an array otherwise.
   - `archived` of `thread/list` is a boolean: `false` for `"unarchived"`, `true` for `"archived"`.
   - Codex lists unarchived and archived threads apart, so `"all"` sends one request with `archived: false` and one
     with `archived: true` at the same time, and merges the two by recency, ties unarchived first. A row is answered
     only when no unread Codex page can hold a newer one. An empty Codex page that has a cursor tells nothing about
     that, so the adapter reads on in that list first; these reads count against the budget below.
-  - `sourceKinds: []` means the interactive sources, so `codex exec` runs and subagent threads are not listed.
+  - Both AIR and standard ACP include CLI, VS Code, app-server and unknown sources. The explicit filter excludes
+    `codex exec`, subagents, custom sources and Codex internal helpers.
   - `modelProviders: []` means every provider, whatever the login of the agent.
   - Codex deletes a thread with `thread/delete`, so a deleted thread is never listed, whatever `archived` is.
-- A relative `cwd` keeps the basename filter of the old path: the adapter sends the requests above without `cwd`
-  and with `limit: 100`, filters each page by the basename of `Thread.cwd`, gathers the matches of several Codex
-  pages up to `limit` and cuts them to it.
-  No `cwd` lists every thread.
+- A relative `cwd` matches the basename of `Thread.cwd`. For an absolute `cwd` unavailable to the native index,
+  such as an imported Windows path on Linux, the adapter compares normalized full paths. Both filters send
+  requests without `cwd` and with `limit: 100`, then gather matches from Codex pages up to the requested limit.
+  Worktree discovery requires a native path. No `cwd` lists every thread.
 - Rows are ordered by last user activity, `lastPromptAt ?? updatedAt`, newest first, ties in the Codex order:
   Codex sorts by `recency_at`, which it moves when a turn starts.
 - `title` is the first non-blank of `Thread.name`, `title`, `summary` and `preview`, collapsed to one line, as AIR's
@@ -1237,12 +1244,13 @@ or worktrees are eligible; the client applies display filters.
 ```
 
 The example IDs stand for Codex thread IDs. `sessions` contains full
-`session/list` rows in relative request order. Absent, unreadable and
-ID-mismatched records are omitted, and so are threads that `session/list` does
-not show: ephemeral threads, threads from a source other than the CLI or an IDE
-extension (such as `exec` or a subagent), threads without a first user message
-and threads without a stored rollout. Merge returned rows with the recent page by
-`sessionId`; an omitted ID need not remove its pinned or folder reference.
+`session/list` rows in relative request order. A row requires a readable record with
+a matching ID, an included source, a nonempty preview and a stored rollout path.
+Ephemeral threads are omitted. When `thread/read` labels an internal helper as
+`unknown`, the adapter excludes it if Codex also supplies the Guardian or memory
+consolidation marker. Legacy reads can omit that marker, so a batch can return an
+internal thread that the list excludes. Merge returned rows with the recent page by
+`sessionId`. An omitted ID need not remove its pinned or folder reference.
 
 `{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
 Failed metadata reads omit the corresponding rows. Connection loss, process
@@ -1279,9 +1287,10 @@ still re-reads the list now and then, and a lost change shows up there.
 
 - `_session/list/subscribe {cwd}` answers `{subscriptionId}`. `cwd` is required and absolute; a missing `cwd`, one
   that is not a string and a relative one fail with `-32602`. The request has no other parameters.
-- Scope: the threads whose cwd is `cwd`, its canonical path, or the same subdirectory in the primary checkout and
-  in each linked Git worktree, as `includeWorktrees: true` resolves it; from the interactive sources, as the list;
-  archived or not. The agent applies no archive filter: the client filters by the `archived` field of the row.
+- The subscription covers the same sources as the session list, including archived sessions. It includes threads
+  whose cwd is `cwd`, its canonical path, or the same subdirectory in the primary checkout and each linked Git
+  worktree, as `includeWorktrees: true` resolves it. The client can filter by the `archived` field of the row.
+  A change found through `thread/read` has the same legacy source ambiguity as [batch get](#batch-get).
   The agent resolves the worktrees of a subscription again every 10 s, and at most once a second for a changed
   thread whose cwd is not in its scope. A thread of a worktree created less than a second before its change can
   show only with its next change.
@@ -1322,7 +1331,8 @@ How the agent sees changes:
   `<CODEX_HOME>/state_<n>.sqlite-wal`. The agent watches the WAL files and CODEX_HOME for WAL files that appear or
   go, and checks the WAL size and time every 30 s in case the file system drops an event. 150 ms after the last
   write, and at most 1 s after the first, it sends one `thread/list` without `cwd`, with `sortKey: "updated_at"`,
-  for unarchived threads, and reads newest first until the threads are older than the newest one it saw before.
+  for unarchived threads. It applies the same source filter as the session list and reads newest first until the
+  threads are older than the newest one it saw before.
   Threads of the same second as that one are read again. It lists no archived threads: an archived thread does
   not run. A scan reads at most 920 threads; one that stops there goes on where it stopped with the next scan, 150 ms later,
   and the newest one it saw counts only once it reached the old one; a scan from the top follows when a write came

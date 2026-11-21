@@ -2,6 +2,7 @@ import {describe, expect, it} from "vitest";
 import {
     arePathBasenamesEqual,
     arePathsEqual,
+    fileUriFromPath,
     isAbsolutePathLike,
     isAbsoluteProtocolPath,
     normalizePathForComparison,
@@ -14,6 +15,16 @@ describe("PathUtils", () => {
         ["C:repo", false], ["\\repo", false], ["/workspace\0", false],
     ] as const)("checks the ACP absolute-path syntax: %j", (value, expected) => {
         expect(isAbsoluteProtocolPath(value)).toBe(expected);
+    });
+
+    it.each([
+        [String.raw`/workspace/report #1\notes % lab.txt`, "file:///workspace/report%20%231%5Cnotes%20%25%20lab.txt"],
+        [String.raw`C:\workspace\report #1.txt`, "file:///C:/workspace/report%20%231.txt"],
+        ["//server/share/report #1.txt", "file://server/share/report%20%231.txt"],
+        [String.raw`\\server/share\report #1.txt`, "file://server/share/report%20%231.txt"],
+        ["C:\\workspace\\\ud800.txt", null],
+    ] as const)("converts a recorded path to a file URI independent of the host: %j", (value, expected) => {
+        expect(fileUriFromPath(value)).toBe(expected);
     });
 
     it("normalizes Windows paths for comparison", () => {

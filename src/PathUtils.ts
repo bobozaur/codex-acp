@@ -1,3 +1,4 @@
+import {realpathSync} from "node:fs";
 import path from "node:path";
 
 /** ACP paths are native POSIX or fully qualified Windows paths, never file URIs. */
@@ -5,8 +6,55 @@ export function isAbsoluteProtocolPath(value: string): boolean {
     return !value.includes("\0") && (path.posix.isAbsolute(value) || isWindowsAbsolutePath(value));
 }
 
+/** Converts a recorded path to a file URI independent of the adapter's OS. */
+export function fileUriFromPath(value: string): string | null {
+    if (value.includes("\0")) return null;
+    try {
+        if (value.startsWith("file://")) return new URL(value).href;
+        if (isWindowsAbsolutePath(value)) {
+            const portablePath = value.replaceAll("\\", "/");
+            if (portablePath.startsWith("//")) {
+                const share = portablePath.indexOf("/", 2);
+                const host = portablePath.slice(2, share);
+                return new URL(`file://${encodeURIComponent(host)}${encodePath(portablePath.slice(share))}`).href;
+            }
+            return `file:///${portablePath.slice(0, 2)}${encodePath(portablePath.slice(2))}`;
+        }
+        return path.posix.isAbsolute(value) ? `file://${encodePath(path.posix.normalize(value))}` : null;
+    } catch {
+        return null;
+    }
+}
+
+function encodePath(value: string): string {
+    return value.split("/").map(encodeURIComponent).join("/");
+}
+
 export function isAbsolutePathLike(value: string): boolean {
     return isAbsoluteProtocolPath(value.trim());
+}
+
+/** A cwd Codex can match in its native index. Imported or missing Windows paths need portable comparison. */
+export function nativeSessionListCwd(value: string): string | null {
+    if (!isAbsoluteProtocolPath(value)) return null;
+    if (isWindowsAbsolutePath(value)) return process.platform === "win32" ? canonicalNativePath(value) : null;
+    return process.platform !== "win32" && path.posix.isAbsolute(value) ? value : null;
+}
+
+export function canonicalNativePath(value: string): string | null {
+    if (!path.isAbsolute(value)) return null;
+    try {
+        return realpathSync.native(value);
+    } catch {
+        return null;
+    }
+}
+
+/** Matches a cwd when the list cannot send it to Codex's native index. */
+export function sessionListCwdMatcher(cwd: string): (storedCwd: string) => boolean {
+    if (!isAbsolutePathLike(cwd)) return storedCwd => arePathBasenamesEqual(storedCwd, cwd);
+    const key = normalizePathForComparison(cwd);
+    return storedCwd => normalizePathForComparison(storedCwd) === key;
 }
 
 export function arePathsEqual(left: string, right: string): boolean {
@@ -33,7 +81,7 @@ export function normalizePathForComparison(value: string): string {
         return trimTrailingPathSeparators(normalized).toLowerCase();
     }
 
-    const pathForComparison = path.isAbsolute(trimmed)
+    const pathForComparison = path.posix.isAbsolute(trimmed)
         ? trimmed
         : trimmed.replace(/\\/g, "/");
     const normalized = path.posix.normalize(pathForComparison);

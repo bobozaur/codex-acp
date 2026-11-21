@@ -156,6 +156,7 @@ async function runInWorkspace(
     ].map(name => ({name, command: "npx", args: [name], env: []}));
 
     if (scenario.history !== undefined) {
+        anyAppServer.threadRead = vi.fn().mockResolvedValue({thread: {...thread([], workspace), turns: []}});
         const response = await agent.loadSession({sessionId: SESSION_ID, cwd: workspace, mcpServers});
         recorded.push({direction: "response", method: "session/load", params: response});
         await client.waitForSessionNotifications(SESSION_ID);

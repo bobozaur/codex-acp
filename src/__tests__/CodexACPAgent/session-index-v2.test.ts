@@ -212,6 +212,26 @@ describe('AIR sessionIndex over ACP v2', () => {
             unsubscribe,
         })).toMatchFileSnapshot('data/session-index-v2-subscription.json');
     });
+
+    it('lists and pushes the same imported project session across equivalent cwd spellings', async () => {
+        const stored = createThread({cwd: "Z:\\Retained\\Project\\", path: "/codex-home/sessions/rollout.jsonl"});
+        const {connection, listChanges, sendServerNotification} = await connectV2Client(["sessionIndex"], {
+            threads: [stored, createThread({id: "same-basename", cwd: "Z:/other/project"})],
+            threadRead: stored,
+        });
+        closeClient = () => connection.close();
+
+        const {sessions} = await connection.agent.request(acpV2.methods.agent.session.list, {cwd: "z:/retained/project"});
+        expect(sessions.map(row => row.sessionId)).toEqual([sessionId]);
+        const {subscriptionId} = await connection.agent.request(SESSION_LIST_SUBSCRIBE_METHOD, {
+            cwd: "z:/Retained/Project/",
+        }) as {subscriptionId: string};
+        sendServerNotification({method: "thread/name/updated", params: {threadId: sessionId}});
+
+        await vi.waitFor(() => expect(listChanges).toEqual([{
+            subscriptionId, sessions, removed: [],
+        }]));
+    });
     // #606: rows are titled by the first non-blank of name, title, summary and preview, without a cut.
     it.each([[["sessionIndex"]], [[]]])('titles session/list rows by name, title, summary, then preview (AIR capabilities: %j)', async (airCapabilities) => {
         const longPreview = `Investigate ${"x".repeat(MAX_SESSION_TITLE_LENGTH)}\n end`;

@@ -6,6 +6,8 @@ Use [OpenAI Codex](https://github.com/openai/codex) from [Agent Client Protocol]
 
 `codex-acp` is a stdio ACP agent server. By default it starts `codex remote-control start` and connects to the shared daemon through `codex app-server proxy`. Explicit provider overrides use a dedicated Codex process. It translates ACP requests into Codex operations and maps Codex events back into the client.
 
+For conversations started on a phone, see [showing mobile threads in Zed](docs/zed-mobile-threads.md).
+
 ## Features
 
 - ChatGPT, API key, and client-provided custom gateway authentication.

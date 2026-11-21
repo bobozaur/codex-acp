@@ -241,7 +241,9 @@ describe("app-server recovery", () => {
         completeTurn(fixture, sessionId);
         await expect(next).resolves.toMatchObject({stopReason: "end_turn"});
         expect(fixture.servers).toHaveLength(2);
-        expect(requestsOf(fixture.current(), "thread/resume")).toEqual([expect.objectContaining({threadId: sessionId, cwd: "/work"})]);
+        const resumes = requestsOf(fixture.current(), "thread/resume");
+        expect(resumes).toEqual([expect.objectContaining({threadId: sessionId})]);
+        expect(resumes[0]).not.toHaveProperty("cwd");
         expect(requestsOf(fixture.current(), "turn/start").filter(params => (params as {threadId: string}).threadId === sessionId))
             .toEqual([expect.objectContaining({threadId: sessionId, model: MODEL.id, effort: "high"})]);
     });
@@ -389,8 +391,7 @@ describe("app-server recovery", () => {
         const fixture = createRecoveryFixture();
         const sessionId = await openSession(fixture);
         await fixture.kill();
-        fixture.answers.set("thread/resume", () => new Error("no rollout found for thread id thread-new"));
-        fixture.answers.set("thread/read", () => new Error("thread not loaded"));
+        fixture.answers.set("thread/read", () => new Error(`thread not loaded: ${sessionId}`));
 
         await expect(fixture.agent.prompt({sessionId, prompt: [{type: "text", text: "hi"}]})).rejects.toMatchObject({
             code: 1001,
@@ -496,18 +497,17 @@ describe("app-server recovery", () => {
         const fixture = createRecoveryFixture();
         const empty = await openSession(fixture);
         await fixture.agent.resumeSession({sessionId: "persisted", cwd: "/work", mcpServers: []});
-        fixture.answers.set("thread/resume", (params) => (params as {threadId: string}).threadId === empty
-            ? new Error(`no rollout found for thread id ${empty}`)
-            : defaultAnswer("thread/resume", params));
-        fixture.answers.set("thread/read", () => new Error("thread not loaded"));
+        fixture.answers.set("thread/read", (params) => (params as {threadId: string}).threadId === empty
+            ? new Error(`thread not loaded: ${empty}`)
+            : defaultAnswer("thread/read", params));
 
         await fixture.agent.setProvider({providerId: "openai", apiType: "openai", baseUrl: "https://gateway.example/v1"});
 
         expect(fixture.servers).toHaveLength(2);
-        expect(requestsOf(fixture.current(), "thread/resume")).toEqual(expect.arrayContaining([
-            expect.objectContaining({threadId: empty}),
+        expect(requestsOf(fixture.current(), "thread/read")).toContainEqual(expect.objectContaining({threadId: empty}));
+        expect(requestsOf(fixture.current(), "thread/resume")).toEqual([
             expect.objectContaining({threadId: "persisted"}),
-        ]));
+        ]);
         await expect(fixture.agent.prompt({sessionId: empty, prompt: [{type: "text", text: "hi"}]})).rejects.toMatchObject({
             code: 1001,
             message: `Session ${empty} had no messages yet and was lost when the Codex app-server restarted. Start a new session.`,

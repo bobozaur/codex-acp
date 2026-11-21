@@ -45,7 +45,12 @@
         "limit": 10,
         "sortKey": "recency_at",
         "archived": false,
-        "sourceKinds": [],
+        "sourceKinds": [
+          "cli",
+          "vscode",
+          "appServer",
+          "unknown"
+        ],
         "modelProviders": [],
         "cwd": "/workspace",
         "useStateDbOnly": true

@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+import {realpathSync} from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk/unstable";
 import { createCodexMockTestFixture } from "../acp-test-utils";
 import type { Thread } from "../../app-server/v2";
 
 describe("CodexACPAgent - list sessions", () => {
-    it("should list sessions filtered by cwd", async () => {
+    it("lists a project's sessions even when newer threads fill the global page", async () => {
         const fixture = createCodexMockTestFixture();
+        const projectCwd = realpathSync.native(".");
         const codexAcpAgent = fixture.getCodexAcpAgent();
         const codexAcpClient = fixture.getCodexAcpClient();
         const codexAppServerClient = fixture.getCodexAppServerClient();
@@ -29,7 +31,7 @@ describe("CodexACPAgent - list sessions", () => {
             recencyAt: null,
             status: { type: "idle" },
             path: null,
-            cwd: "/repo/project",
+            cwd: projectCwd,
             cliVersion: "0.0.0",
             section: null,
             sectionEnteredAt: null,
@@ -73,10 +75,11 @@ describe("CodexACPAgent - list sessions", () => {
             turns: [],
         };
 
-        codexAppServerClient.threadList = vi.fn().mockResolvedValue({
-            data: [threadA, threadB],
+        vi.spyOn(codexAppServerClient, "threadList").mockImplementation(async params => ({
+            data: params.cwd === projectCwd ? [threadA] : [threadB],
             nextCursor: "next-cursor",
-        });
+            backwardsCursor: null,
+        }));
         codexAppServerClient.threadLoadedList = vi.fn().mockResolvedValue({
             data: [],
             nextCursor: null,
@@ -84,12 +87,15 @@ describe("CodexACPAgent - list sessions", () => {
         codexAppServerClient.threadRead = vi.fn();
 
         const params: acp.ListSessionsRequest = {
-            cwd: "/repo/project",
-            cursor: null,
+            cwd: projectCwd,
+            cursor: "previous-page",
         };
         const response = await codexAcpAgent.listSessions(params);
 
         expect(codexAppServerClient.threadList).toHaveBeenCalledWith(expect.objectContaining({
+            cwd: projectCwd,
+            cursor: "previous-page",
+            sortKey: "updated_at",
             sourceKinds: [
                 "cli",
                 "vscode",
@@ -99,7 +105,7 @@ describe("CodexACPAgent - list sessions", () => {
             // Codex answers from the state DB instead of scanning every rollout file.
             useStateDbOnly: true,
         }));
-        await expect(JSON.stringify(response, null, 2)).toMatchFileSnapshot(
+        await expect(JSON.stringify(response, null, 2).replace(JSON.stringify(projectCwd), '"/repo/project"')).toMatchFileSnapshot(
             "data/list-sessions.json"
         );
     });
@@ -186,6 +192,8 @@ describe("CodexACPAgent - list sessions", () => {
         });
 
         expect(basenameResponse.sessions.map(session => session.sessionId)).toEqual(["sess-win"]);
+        const noMatch = await codexAcpAgent.listSessions({cwd: "missing-project"});
+        expect(noMatch.sessions).toEqual([]);
     });
 
     it("should prefer the explicit thread name as the session title", async () => {

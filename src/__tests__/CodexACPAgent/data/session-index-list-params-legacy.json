@@ -1,6 +1,8 @@
 {
   "airWithoutSessionIndex": {
     "cursor": "cursor-1",
+    "cwd": "/repo/project",
+    "sortKey": "updated_at",
     "modelProviders": [],
     "sourceKinds": [
       "cli",
@@ -12,6 +14,8 @@
   },
   "plain": {
     "cursor": "cursor-1",
+    "cwd": "/repo/project",
+    "sortKey": "updated_at",
     "modelProviders": [],
     "sourceKinds": [
       "cli",

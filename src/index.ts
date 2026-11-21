@@ -14,6 +14,7 @@ import {runCodexCli} from "./CodexCli";
 import {prepareCodexHookConfig} from "./CodexHookConfig";
 import {createAcpAgentRouter} from "./AcpAgentRouter";
 import type {AcpClientConnection, AcpV2Connection} from "./ACPSessionConnection";
+import {loadReplayFileMap} from "./ReplayFileMap";
 
 if (process.argv.includes("--version")) {
     console.log(`${packageJson.name} ${packageJson.version}`);
@@ -83,6 +84,7 @@ function startAcpServer() {
     });
 
     const acpJsonStream = createJsonStream(process.stdin, process.stdout);
+    const replayFileMap = loadReplayFileMap(process.env["CODEX_ACP_REPLAY_FILE_MAP"]);
 
     function createAgent(connection: AcpClientConnection | AcpV2Connection): CodexAcpServer {
         const appServerClient = new CodexAppServerClient(codexProcessState.connection.connection);
@@ -94,6 +96,7 @@ function startAcpServer() {
             undefined,
             undefined,
             codexProcessState,
+            replayFileMap,
         );
     }
 

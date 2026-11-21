@@ -34,6 +34,7 @@ import {isDeepStrictEqual} from "node:util";
 import {logger} from "./Logger";
 import {isAccountReadAuthFailureError, isAccountReadUnavailableError} from "./CodexThreadErrors";
 import {listedSessionTitle, normalizeSessionTitle} from "./SessionTitle";
+import {SESSION_LIST_SOURCE_KINDS} from "./SessionListSources";
 import {type AcpMcpServer, type WithAcpMcpServers, normalizeMcpServers, toCodexMcpServerConfig} from "./McpServerConfig";
 import type {
     AccountUpdatedNotification,
@@ -57,7 +58,6 @@ import type {
     ThreadGoal,
     ThreadGoalStatus,
     ThreadResumeParams,
-    ThreadSourceKind,
     ThreadItem,
     ThreadItemEntry,
     Turn,
@@ -69,7 +69,7 @@ import packageJson from "../package.json";
 import type {AuthenticationStatusResponse} from "./AcpExtensions";
 import {createCodexCollaborationMode} from "./CollaborationModeConfig";
 import type {ModeKind} from "./app-server/ModeKind";
-import {arePathBasenamesEqual, arePathsEqual, isAbsolutePathLike, isAbsoluteProtocolPath} from "./PathUtils";
+import {arePathsEqual, canonicalNativePath, isAbsolutePathLike, isAbsoluteProtocolPath, nativeSessionListCwd, sessionListCwdMatcher} from "./PathUtils";
 import {CodexSubagentSubscriptions} from "./subagents/CodexSubagentSubscriptions";
 import {forkSession as runForkSession} from "./SessionFork";
 import type {PreservedTurnSettings, SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
@@ -702,20 +702,8 @@ export class CodexAcpClient {
         onSubscribed?: () => void,
         previousInstructions?: SessionInstructions,
     ): Promise<SessionMetadata> {
-        const instructions = await this.resolveSessionInstructions(request, previousInstructions);
-        const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
-        await this.refreshSkills(request.cwd, additionalDirectories);
-
-        const {config, skippedMcpServers, defaultPermissionProfileId, ...permissionProfileMetadata} =
-            await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []);
-        const response = await this.resumeThreadWithInstructions({
-            excludeTurns: true,
-            config,
-            cwd: request.cwd,
-            modelProvider: await this.getResumeModelProvider(),
-            threadId: request.sessionId,
-            ...(instructions?.text !== undefined ? {developerInstructions: instructions.developerInstructions} : {}),
-        }, request, previousInstructions);
+        const {response, cwd, instructions, additionalDirectories, skippedMcpServers, defaultPermissionProfileId, ...permissionProfileMetadata} =
+            await this.attachSession(request, previousInstructions);
         onSubscribed?.();
         const thread = response.materialized && response.thread.status?.type === "active"
             ? await hydrateThreadHistory(this.codexClient, response.thread, response)
@@ -739,7 +727,7 @@ export class CodexAcpClient {
             ...(instructions ? {instructions} : {}),
             activePermissionProfileId: response.materialized ? response.activePermissionProfileId : defaultPermissionProfileId ?? null,
             ...permissionProfileMetadata,
-            cwd: response.cwd ?? request.cwd,
+            cwd: response.cwd ?? cwd,
             ...(turnSettings ? {turnSettings} : {}),
             activeTurnId: findActiveTurnId(thread),
             ...(Array.isArray(thread.turns) ? {threadSnapshot: thread} : {}),
@@ -748,7 +736,7 @@ export class CodexAcpClient {
 
     async forkSession(
         request: WithAcpMcpServers<acp.ForkSessionRequest>,
-        releaseFailedFork: (threadId: string) => Promise<void> = threadId => this.closeSession(threadId),
+        releaseFailedFork: (threadId: string) => Promise<void> = threadId => this.detachSession(threadId),
         forkCreated: (threadId: string) => void = () => {},
         previousInstructions?: SessionInstructions,
     ): Promise<SessionMetadata> {
@@ -774,20 +762,8 @@ export class CodexAcpClient {
         onSubscribed?: () => void,
         previousInstructions?: SessionInstructions,
     ): Promise<SessionMetadataWithThread> {
-        const instructions = await this.resolveSessionInstructions(request, previousInstructions);
-        const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
-        await this.refreshSkills(request.cwd, additionalDirectories);
-
-        const {config, skippedMcpServers, defaultPermissionProfileId, ...permissionProfileMetadata} =
-            await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []);
-        const response = await this.resumeThreadWithInstructions({
-            excludeTurns: true,
-            config,
-            cwd: request.cwd,
-            modelProvider: await this.getResumeModelProvider(),
-            threadId: request.sessionId,
-            ...(instructions?.text !== undefined ? {developerInstructions: instructions.developerInstructions} : {}),
-        }, request, previousInstructions);
+        const {response, cwd, instructions, additionalDirectories, skippedMcpServers, defaultPermissionProfileId, ...permissionProfileMetadata} =
+            await this.attachSession(request, previousInstructions);
         onSubscribed?.();
         // Resume cursors bound durable history; later turns arrive through live events.
         // A null paginated cursor means there was no durable history at resume time.
@@ -803,7 +779,7 @@ export class CodexAcpClient {
             }
         } else if (response.materialized) {
             // A legacy store reads the whole history in one request.
-            const legacy = (await this.codexClient.threadReadWithHistory(response.thread.id)).thread;
+            const legacy = (await this.codexClient.threadReadWithHistory(response.thread.id, response.thread)).thread;
             threadSnapshot = legacy;
             thread = {...legacy, turns: []};
             history = oneItemPage(legacy.turns.flatMap(turn => turn.items.map(item => ({
@@ -834,7 +810,7 @@ export class CodexAcpClient {
             collaborationMode: response.collaborationMode ?? this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
             currentServiceTier: response.serviceTier ?? null,
-            cwd: response.cwd ?? request.cwd,
+            cwd: response.cwd ?? cwd,
             ...(turnSettings ? {turnSettings} : {}),
             activeTurnId,
             ...(threadSnapshot ? {threadSnapshot} : {}),
@@ -846,6 +822,34 @@ export class CodexAcpClient {
             activePermissionProfileId: response.materialized ? response.activePermissionProfileId : defaultPermissionProfileId ?? null,
             ...permissionProfileMetadata,
         };
+    }
+
+    private async attachSession(
+        request: WithAcpMcpServers<acp.ResumeSessionRequest> | WithAcpMcpServers<acp.LoadSessionRequest>,
+        previousInstructions?: SessionInstructions,
+    ) {
+        const {thread} = await this.codexClient.threadRead({threadId: request.sessionId, includeTurns: false});
+        const cwd = thread.cwd;
+        if (request.cwd !== cwd) {
+            const requestedPath = canonicalNativePath(request.cwd);
+            const savedPath = canonicalNativePath(cwd);
+            if (!arePathsEqual(requestedPath ?? request.cwd, savedPath ?? cwd)) {
+                throw RequestError.invalidParams({cwd}, "Use the saved working directory when opening this session");
+            }
+        }
+        const instructions = await this.resolveSessionInstructions({...request, cwd}, previousInstructions);
+        const additionalDirectories = readAdditionalDirectories(cwd, request.additionalDirectories, request._meta);
+        await this.refreshSkills(cwd, additionalDirectories);
+        const {config, ...metadata} = await this.createSessionConfig(cwd, additionalDirectories, request.mcpServers ?? []);
+        // A native cwd override can move the saved thread on cold resume.
+        const response = await this.resumeThreadWithInstructions({
+            excludeTurns: true,
+            config,
+            modelProvider: await this.getResumeModelProvider(),
+            threadId: request.sessionId,
+            ...(instructions?.text !== undefined ? {developerInstructions: instructions.developerInstructions} : {}),
+        }, thread, request, previousInstructions);
+        return {...metadata, response, cwd, instructions, additionalDirectories};
     }
 
     /**
@@ -970,11 +974,11 @@ export class CodexAcpClient {
 
     private async resumeThreadWithInstructions(
         params: ThreadResumeParams,
+        thread: Thread,
         request: {sessionId: string; systemPrompt?: unknown; _meta?: unknown},
         previous?: SessionInstructions,
     ): Promise<ResumedThread> {
         if (!changesSystemPrompt(request, previous)) return this.resumeThread(params);
-        const {thread} = await this.codexClient.threadRead({threadId: request.sessionId});
         if (thread.status.type === "notLoaded") return this.resumeThread(params);
         if (thread.status.type !== "idle" || thread.path === null) {
             throw acp.RequestError.invalidParams(
@@ -1034,9 +1038,13 @@ export class CodexAcpClient {
         for (const threadId of [...children, sessionId]) {
             await this.stopBackgroundTerminals(threadId);
         }
+        await this.detachSession(sessionId);
+    }
+
+    /** Releases this connection's attachment without stopping work on the shared thread. */
+    async detachSession(sessionId: string): Promise<void> {
         await this.codexClient.threadUnsubscribe({threadId: sessionId});
-        this.codexClient.clearThreadHandlers(sessionId);
-        this.subagents.clear(sessionId);
+        this.discardSessionSubscription(sessionId);
     }
 
     private async stopBackgroundTerminals(threadId: string): Promise<void> {
@@ -1061,13 +1069,7 @@ export class CodexAcpClient {
         }
     }
 
-    /**
-     * Drops a session's notification handler without unsubscribing on the
-     * app-server: for a baseline tracker registered before `thread/resume`
-     * (to catch a Codex-initiated turn that starts before setup finishes)
-     * whose resume/load never actually subscribed the connection, so there
-     * is nothing to unsubscribe there.
-     */
+    /** Removes local handlers without changing the app-server subscription. */
     discardSessionSubscription(sessionId: string): void {
         this.codexClient.clearThreadHandlers(sessionId);
         this.subagents.clear(sessionId);
@@ -1602,54 +1604,31 @@ export class CodexAcpClient {
     }
 
     async listSessions(request: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
-        // `codex exec` and `codex review` runs are not chats, so the list leaves them out, as the Codex TUI does.
-        const sourceKinds: ThreadSourceKind[] = [
-            "cli",
-            "vscode",
-            "appServer",
-            "unknown",
-        ];
-        const requestedCwd = request.cwd?.trim() ?? null;
-        const filterByCwd = (thread: Thread): boolean => {
-            if (!requestedCwd) return true;
-            if (isAbsolutePathLike(requestedCwd)) {
-                return arePathsEqual(thread.cwd, requestedCwd);
-            }
-            return arePathBasenamesEqual(thread.cwd, requestedCwd);
-        };
-
+        const requestedCwd = request.cwd?.trim() || null;
+        const nativeCwd = requestedCwd === null ? null : nativeSessionListCwd(requestedCwd);
         const preferredProvider = this.getModelProvider();
-        const modelProviders = preferredProvider ? [preferredProvider] : [];
-        // The state DB answers in milliseconds. Without the flag, Codex scans and repairs every rollout file on
-        // each call, which took about 4 s per page.
+        // Scope native paths before pagination so other projects cannot occupy the requested page.
         const listResponse = await this.codexClient.threadList({
             cursor: request.cursor ?? null,
-            modelProviders: modelProviders,
-            sourceKinds: sourceKinds,
+            ...(nativeCwd === null ? {} : {cwd: nativeCwd}),
+            sortKey: "updated_at",
+            modelProviders: preferredProvider ? [preferredProvider] : [],
+            sourceKinds: [...SESSION_LIST_SOURCE_KINDS],
             useStateDbOnly: true,
         });
 
-        const mapThreadToSession = (thread: Thread) => ({
-            sessionId: thread.id,
-            cwd: thread.cwd,
-            title: listedSessionTitle(thread),
-            updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
-        });
-
-        let sessions = listResponse.data.map(mapThreadToSession);
-        if (requestedCwd) {
-            const filtered = listResponse.data
-                .filter(filterByCwd)
-                .map(mapThreadToSession);
-            if (filtered.length > 0 || isAbsolutePathLike(requestedCwd)) {
-                sessions = filtered;
-            } else {
-                logger.log("Ignoring non-absolute cwd filter for session/list", {cwd: requestedCwd});
-            }
+        let threads = listResponse.data;
+        if (requestedCwd !== null && nativeCwd === null) {
+            const matches = sessionListCwdMatcher(requestedCwd);
+            threads = threads.filter(thread => matches(thread.cwd));
         }
-
         return {
-            sessions,
+            sessions: threads.map(thread => ({
+                sessionId: thread.id,
+                cwd: thread.cwd,
+                title: listedSessionTitle(thread),
+                updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
+            })),
             nextCursor: listResponse.nextCursor ?? null,
         };
     }

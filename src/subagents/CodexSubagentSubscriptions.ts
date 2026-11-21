@@ -177,8 +177,9 @@ export class CodexSubagentSubscriptions {
     private registerInteractiveHandlers(session: SessionSubscription, targetSessionId: string): void {
         this.client.onApprovalRequest(targetSessionId, {
             handleCommandExecution: async (params) => {
+                // Setup can replace the startup handler while this request waits for replay.
+                await session.current.waitForRootNotifications();
                 const current = session.current;
-                await current.waitForRootNotifications();
                 if (this.client.isServerRequestResolved(params)) return {decision: "cancel"};
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {decision: "cancel"};
@@ -188,8 +189,8 @@ export class CodexSubagentSubscriptions {
                 return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
             handleFileChange: async (params) => {
+                await session.current.waitForRootNotifications();
                 const current = session.current;
-                await current.waitForRootNotifications();
                 if (this.client.isServerRequestResolved(params)) return {decision: "cancel"};
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {decision: "cancel"};
@@ -199,8 +200,8 @@ export class CodexSubagentSubscriptions {
                 return current.withUserAction ? current.withUserAction(sessionId, params.itemId, request, params.turnId) : request();
             },
             handlePermissionsRequest: async (params) => {
+                await session.current.waitForRootNotifications();
                 const current = session.current;
-                await current.waitForRootNotifications();
                 if (this.client.isServerRequestResolved(params)) {
                     return {permissions: {}, scope: "turn", strictAutoReview: false};
                 }
@@ -214,8 +215,8 @@ export class CodexSubagentSubscriptions {
         });
         this.client.onElicitationRequest(targetSessionId, {
             handleElicitation: async (params) => {
+                await session.current.waitForRootNotifications();
                 const current = session.current;
-                await current.waitForRootNotifications();
                 if (this.client.isServerRequestResolved(params)) {
                     return {action: "cancel", content: null, _meta: null};
                 }
@@ -227,8 +228,8 @@ export class CodexSubagentSubscriptions {
                 return current.withUserAction ? current.withUserAction(sessionId, undefined, request, params.turnId) : request();
             },
             handleUserInput: async (params) => {
+                await session.current.waitForRootNotifications();
                 const current = session.current;
-                await current.waitForRootNotifications();
                 if (this.client.isServerRequestResolved(params)) return {answers: {}};
                 const sessionId = await this.interactionSessionId(current, targetSessionId);
                 if (sessionId === null) return {answers: {}};

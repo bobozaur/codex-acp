@@ -3,9 +3,9 @@
  * `_session/list/changes`. Best effort: the client also re-reads the list now and then.
  *
  * A subscription covers the threads of its cwd and of the same subdirectory in the primary checkout and each
- * linked worktree, from the interactive sources, archived or not. Subscriptions of one cwd share one group:
- * the rows last computed for its threads. Each subscription keeps the signature of the rows it was sent: the
- * first change of a thread goes out in full, a later one only when it differs in more than `updatedAt`.
+ * linked worktree. It uses the session list's sources and covers archived sessions. Subscriptions of one cwd
+ * share the rows last computed for its threads. Each subscription keeps the signature of the rows it was sent:
+ * the first change of a thread goes out in full, a later one only when it differs in more than `updatedAt`.
  *
  * Changes come from two places:
  * - The thread notifications of this adapter's app-server. Each names a thread, which is read with
@@ -20,14 +20,15 @@
  */
 
 import {randomUUID} from "node:crypto";
-import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk/unstable";
 import {RequestError} from "@agentclientprotocol/sdk/unstable";
 import type {ServerNotification} from "./app-server";
 import type {Thread, ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse} from "./app-server/v2";
 import {CodexHomeWatcher, type CodexHomeWatcherListener} from "./CodexHomeWatcher";
 import {logger} from "./Logger";
-import {isInteractiveSource, listedThreadEntry, sessionIndexRowForkedFrom, sessionIndexRowSignature} from "./SessionIndex";
+import {normalizePathForComparison} from "./PathUtils";
+import {listedThreadEntry, sessionIndexRowForkedFrom, sessionIndexRowSignature} from "./SessionIndex";
+import {hasSessionListSource, SESSION_LIST_SOURCE_KINDS} from "./SessionListSources";
 import {isMissingThreadError} from "./SessionIndexMutations";
 import {SessionNameLog} from "./SessionNameLog";
 
@@ -213,12 +214,12 @@ export class SessionListSubscriptions {
                 `At most ${MAX_SESSION_LIST_SUBSCRIPTIONS} session list subscriptions per connection`,
             );
         }
-        const key = path.resolve(cwd);
+        const key = normalizePathForComparison(cwd);
         let group = this.groups.get(key);
         if (group === undefined) {
             const created: Group = {
-                cwd: key,
-                scope: new Set(this.deps.scopeCwds(key)),
+                cwd,
+                scope: this.resolveScope(cwd),
                 subscriptions: new Set(),
                 rows: new Map(),
                 ready: Promise.resolve(),
@@ -259,7 +260,8 @@ export class SessionListSubscriptions {
         if (subscription.readyTimer !== null) clearTimeout(subscription.readyTimer);
         const group = subscription.group;
         group.subscriptions.delete(subscription);
-        if (group.subscriptions.size === 0 && this.groups.get(group.cwd) === group) this.groups.delete(group.cwd);
+        const key = normalizePathForComparison(group.cwd);
+        if (group.subscriptions.size === 0 && this.groups.get(key) === group) this.groups.delete(key);
         if (this.subscriptions.size === 0) this.stopWatching();
     }
 
@@ -290,7 +292,7 @@ export class SessionListSubscriptions {
         switch (notification.method) {
             case "thread/started": {
                 const thread = notification.params.thread;
-                if (thread.ephemeral || !isInteractiveSource(thread)) {
+                if (thread.ephemeral || !hasSessionListSource(thread)) {
                     this.ignore(thread.id);
                     return;
                 }
@@ -638,7 +640,8 @@ export class SessionListSubscriptions {
                 resolvedForDeletions = true;
                 this.placeCwd("", true);
             }
-            const covering = cwd === undefined ? [] : [...this.groups.values()].filter(group => group.scope.has(cwd));
+            const cwdKey = cwd === undefined ? null : normalizePathForComparison(cwd);
+            const covering = cwdKey === null ? [] : [...this.groups.values()].filter(group => group.scope.has(cwdKey));
             // Every subscription whose scope has the cwd of the thread, which can be in a list that its client read
             // further down. A deleted thread that no group has seen has an unknown scope: every subscription hears
             // of it.
@@ -779,7 +782,7 @@ export class SessionListSubscriptions {
                 limit: page === 0 && resume === null ? SCAN_FIRST_PAGE : SCAN_NEXT_PAGE,
                 sortKey: "updated_at",
                 archived: false,
-                sourceKinds: [],
+                sourceKinds: [...SESSION_LIST_SOURCE_KINDS],
                 modelProviders: [],
                 useStateDbOnly: true,
             });
@@ -832,8 +835,8 @@ export class SessionListSubscriptions {
             logger.log("Session list subscription cannot read a thread", {threadId, error: String(error)});
             return "failed";
         }
-        if (thread.ephemeral || !isInteractiveSource(thread)) {
-            // A helper thread of the own app-server, which the list never shows: its notifications are skipped.
+        if (thread.ephemeral || !hasSessionListSource(thread)) {
+            // Skip future notifications for threads outside the session list.
             this.ignore(threadId);
             return null;
         }
@@ -852,18 +855,24 @@ export class SessionListSubscriptions {
 
     /** {@link groupsOf}, and whether a group without the cwd could not resolve its worktrees yet. */
     private placeCwd(cwd: string, force = false): {groups: Group[], deferred: boolean} {
+        const key = normalizePathForComparison(cwd);
         const now = this.now();
         let deferred = false;
         for (const group of this.groups.values()) {
             const age = now - group.scopeResolvedAt;
-            if (age >= SCOPE_REFRESH_MS || (!group.scope.has(cwd) && (force || age >= SCOPE_RETRY_MS))) {
+            const inScope = group.scope.has(key);
+            if (age >= SCOPE_REFRESH_MS || (!inScope && (force || age >= SCOPE_RETRY_MS))) {
                 group.scopeResolvedAt = now;
-                group.scope = new Set(this.deps.scopeCwds(group.cwd));
-            } else if (!group.scope.has(cwd)) {
+                group.scope = this.resolveScope(group.cwd);
+            } else if (!inScope) {
                 deferred = true;
             }
         }
-        return {groups: [...this.groups.values()].filter(group => group.scope.has(cwd)), deferred};
+        return {groups: [...this.groups.values()].filter(group => group.scope.has(key)), deferred};
+    }
+
+    private resolveScope(cwd: string): Set<string> {
+        return new Set(this.deps.scopeCwds(cwd).map(normalizePathForComparison));
     }
 }
 

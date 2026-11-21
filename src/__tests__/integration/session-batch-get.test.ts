@@ -16,26 +16,34 @@ describeIntegration("integration: session batch metadata", () => {
         const archived = "00000000-0000-4000-8000-000000000002";
         const corrupt = "00000000-0000-4000-8000-000000000003";
         const absent = "00000000-0000-4000-8000-000000000004";
-        function rollout(id: string, title: string, date: string, isArchived = false): string {
+        const helper = "00000000-0000-4000-8000-000000000005";
+        const legacyHelper = "00000000-0000-4000-8000-000000000006";
+        function rollout(id: string, title: string, date: string, meta: Record<string, unknown> = {}, isArchived = false): string {
             const dir = isArchived ? path.join(home, "archived_sessions") : path.join(home, "sessions", "2026", "01", "01");
             fs.mkdirSync(dir, {recursive: true});
             const file = path.join(dir, `rollout-${date.replace(/:/g, "-")}-${id}.jsonl`);
             const timestamp = `${date}Z`;
             fs.writeFileSync(file, [
                 {timestamp, type: "session_meta", payload: {
-                    id, timestamp, cwd: home, originator: "codex_cli_rs", cli_version: "0.164.0", source: "cli", model_provider: "openai",
+                    id, timestamp, cwd: home, originator: "codex_cli_rs", cli_version: "0.164.0", source: "cli", model_provider: "openai", ...meta,
                 }},
                 {timestamp, type: "event_msg", payload: {type: "user_message", message: title, images: [], local_images: [], text_elements: []}},
             ].map(line => JSON.stringify(line)).join("\n") + "\n");
             fs.utimesSync(file, new Date(timestamp), new Date(timestamp));
             return file;
         }
-        rollout(old, "Older stored copy", "2026-01-01T00:00:00");
-        const selected = rollout(old, "Selected current copy", "2026-01-01T01:00:00");
+        rollout(old, "Older stored copy", "2026-01-01T00:00:00", {source: "mcp"});
+        const selected = rollout(old, "Selected current copy", "2026-01-01T01:00:00", {source: "mcp"});
         // A mature legacy rollout's mtime differs from its creation/session_meta timestamp.
         fs.utimesSync(selected, new Date("2026-01-15T00:00:00Z"), new Date("2026-01-15T00:00:00Z"));
-        rollout(archived, "Archived session", "2026-01-01T02:00:00", true);
+        rollout(archived, "Archived session", "2026-01-01T02:00:00", {source: "unknown"}, true);
         fs.writeFileSync(rollout(corrupt, "Unreadable", "2026-01-01T03:00:00"), "invalid json\n");
+        rollout(helper, "Internal memory consolidation", "2026-01-01T04:00:00", {
+            source: {internal: "memory_consolidation"}, thread_source: "memory_consolidation", history_mode: "paginated",
+        });
+        rollout(legacyHelper, "Legacy internal memory consolidation", "2026-01-01T05:00:00", {
+            source: {internal: "memory_consolidation"}, thread_source: "memory_consolidation",
+        });
         for (let index = 0; index < 60; index++) {
             rollout(`00000000-0000-4000-8000-${(100 + index).toString(16).padStart(12, "0")}`, `Recent ${index}`, "2026-02-01T00:00:00");
         }
@@ -51,8 +59,14 @@ describeIntegration("integration: session batch metadata", () => {
             const recent = await index.list({});
             expect(recent.sessions).toHaveLength(50);
             expect(recent.sessions.map(row => row.sessionId)).not.toContain(old);
+            expect((await fixture.getCodexAppServerClient().threadRead({threadId: helper})).thread).toMatchObject({
+                source: "unknown", threadSource: "memory_consolidation",
+            });
+            expect((await fixture.getCodexAppServerClient().threadRead({threadId: legacyHelper})).thread).toMatchObject({
+                source: "unknown", threadSource: null,
+            });
             fixture.clearCodexConnectionDump();
-            const requested = [archived, corrupt, old, absent, "not-a-uuid"];
+            const requested = [archived, corrupt, old, absent, "not-a-uuid", helper];
             const result = await index.batchGet({sessionIds: requested});
             expect(result.sessions.map(row => row.sessionId)).toEqual([archived, old]);
             expect(result.sessions[1]!.title).toBe("Selected current copy");
@@ -63,6 +77,10 @@ describeIntegration("integration: session batch metadata", () => {
                 eventType: "request", method: "thread/read", params: {threadId, includeTurns: false},
             })));
             const all = await index.list({_meta: {jetbrains: {air: {list: {limit: 100, archived: "all"}}}}});
+            expect(all.sessions.map(row => row.sessionId)).not.toContain(helper);
+            expect(all.sessions.map(row => row.sessionId)).not.toContain(legacyHelper);
+            const ambiguous = await index.batchGet({sessionIds: [legacyHelper]});
+            expect(ambiguous.sessions.map(row => row.sessionId)).toEqual([legacyHelper]);
             const withoutUpdatedAt = ({updatedAt: _updatedAt, ...row}: (typeof result.sessions)[number]) => row;
             expect(result.sessions.map(withoutUpdatedAt)).toEqual([archived, old].map(id => withoutUpdatedAt(all.sessions.find(row => row.sessionId === id)!)));
             // The supported native read has creation-based updatedAt for legacy rollouts; list uses its stored update.

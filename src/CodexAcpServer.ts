@@ -2,7 +2,8 @@ import * as acp from "@agentclientprotocol/sdk/unstable";
 import {RequestError, type SessionId, type SessionModeState} from "@agentclientprotocol/sdk/unstable";
 import {CodexEventHandler, type CompletedPlan, failureWasShownAsMessage} from "./CodexEventHandler";
 import {randomUUID} from "node:crypto";
-import {attachmentFileUri, desktopAttachmentHistory} from "./DesktopAttachmentHistory";
+import {desktopAttachmentHistory} from "./DesktopAttachmentHistory";
+import {fileUriFromPath} from "./PathUtils";
 import {CodexApprovalHandler} from "./permissions/CodexApprovalHandler";
 import {isRecord} from "./permissions/json";
 import {PermissionLifecycleContext} from "./permissions/lifecycle";
@@ -141,7 +142,9 @@ import {
     type SessionSteerRequest,
 } from "./AcpExtensions";
 import {AcpToolCallRenderer} from "./tool-calls/AcpToolCallRenderer";
+import {projectReplayLocations, type ReplayFileMap} from "./ReplayFileMap";
 import {ClientCapabilities} from "./tool-calls/ClientCapabilities";
+import type {ToolFacts} from "./tool-calls/ToolFacts";
 import {CollabAgentReporter} from "./tool-calls/reporters/CollabAgentReporter";
 import {CommandReporter} from "./tool-calls/reporters/CommandReporter";
 import {CompactionReporter} from "./tool-calls/reporters/CompactionReporter";
@@ -377,6 +380,14 @@ function codexRunningTurnId(sessionState: SessionState, turnId: string): string 
     return sessionState.currentTurnId === turnId
         ? sessionState.interruptTurnId ?? turnId
         : turnId;
+}
+
+/** A queued completion from before the resume snapshot must leave the current turn intact. */
+function isOlderRootTurnCompletion(session: SessionState, event: ServerNotification): boolean {
+    if (event.method !== "turn/completed" || event.params.threadId !== session.sessionId) return false;
+    const runningTurn = session.codexReportedRunningTurnId ?? session.currentTurnId;
+    return runningTurn !== null && event.params.turn.id !== runningTurn
+        && event.params.turn.id !== session.currentTurnId && event.params.turn.id !== session.interruptTurnId;
 }
 
 /**
@@ -616,6 +627,7 @@ export class CodexAcpServer {
         getExitCode?: () => number | null,
         getRecentStderr?: () => string,
         codexProcessState?: CodexProcessState,
+        private readonly replayFileMap?: ReplayFileMap,
     ) {
         this.sessions = new Map();
         this.pendingTurnStarts = new Map();
@@ -1183,11 +1195,22 @@ export class CodexAcpServer {
         }
     }
 
-    private restoreExistingSessionTracker(sessionId: string): void {
-        const session = this.sessions.get(sessionId);
-        if (this.instructionUpdates.has(sessionId) && session && !this.sessionIsClosing(sessionId)) {
-            this.startCodexTurnTracker(sessionId, Promise.resolve(session));
-        } else {
+    private async rollbackSessionOpen(
+        sessionId: string,
+        generation: number,
+        subscribed: boolean,
+        settleTrackerReady: (session: SessionState | null) => void,
+    ): Promise<void> {
+        const current = this.sessionOpenCanInstall(sessionId, generation);
+        const bridge = current ? this.currentSessionEventBridge(sessionId, this.codexAcpClient) : undefined;
+        settleTrackerReady(bridge?.sessionState ?? null);
+        if (bridge) {
+            await this.subscribeSessionEventBridge(bridge);
+            // A rejected setup has no successful response to release any paused child traffic.
+            void this.captureSessionSetupPublication(sessionId)();
+        } else if (subscribed) {
+            await this.cleanupStaleSessionOpen(sessionId, generation);
+        } else if (current) {
             this.codexAcpClient.discardSessionSubscription(sessionId);
         }
     }
@@ -1231,7 +1254,7 @@ export class CodexAcpServer {
         try {
             // A dead app-server holds nothing to close.
             if (this.recovery === null || this.recovery.isReady()) {
-                await this.codexAcpClient.closeSession(threadId);
+                await this.codexAcpClient.detachSession(threadId);
             }
         } catch (err) {
             logger.error(`Failed to close the thread of a failed fork ${threadId}`, err);
@@ -1275,7 +1298,7 @@ export class CodexAcpServer {
             try {
                 // A dead app-server holds nothing to close.
                 if (this.recovery === null || this.recovery.isReady()) {
-                    await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(sessionId));
+                    await this.runWithProcessCheck(() => this.codexAcpClient.detachSession(sessionId));
                 }
             } catch (err) {
                 logger.error(`Failed to close stale session open for ${sessionId}`, err);
@@ -1378,13 +1401,8 @@ export class CodexAcpServer {
                     }, previousInstructions);
                 });
             } catch (err) {
-                settleTrackerReady?.(!resumeSubscribed && this.instructionUpdates.has(resumeRequest.sessionId)
-                    ? this.sessions.get(resumeRequest.sessionId) ?? null : null);
-                if (resumeSubscribed && requestedSessionGeneration !== null) {
-                    await this.cleanupStaleSessionOpen(resumeRequest.sessionId, requestedSessionGeneration);
-                } else {
-                    // A rejected instruction change keeps the original session's event delivery.
-                    this.restoreExistingSessionTracker(resumeRequest.sessionId);
+                if (requestedSessionGeneration !== null) {
+                    await this.rollbackSessionOpen(resumeRequest.sessionId, requestedSessionGeneration, resumeSubscribed, resolveTrackerReady);
                 }
                 throw err;
             }
@@ -1416,9 +1434,8 @@ export class CodexAcpServer {
         try {
             authState = await this.getAuthStateForProvider(authProvider, knownAccount);
         } catch (err) {
-            settleTrackerReady?.(null);
-            if (resumeSubscribed && requestedSessionGeneration !== null) {
-                await this.cleanupStaleSessionOpen(sessionId, requestedSessionGeneration);
+            if (requestedSessionGeneration !== null && settleTrackerReady) {
+                await this.rollbackSessionOpen(sessionId, requestedSessionGeneration, resumeSubscribed, settleTrackerReady);
             } else if (operation === "fork") {
                 // The fork stays subscribed after `thread/fork`; without a session nothing would unsubscribe it.
                 await this.releaseFailedFork(sessionId);
@@ -1454,7 +1471,7 @@ export class CodexAcpServer {
             collaborationMode: sessionMetadata.collaborationMode,
             currentTurnId: sessionMetadata.activeTurnId ?? null,
             interruptTurnId: null,
-            codexReportedRunningTurnId: null,
+            codexReportedRunningTurnId: sessionMetadata.activeTurnId ?? null,
             lastTokenUsage: null,
             totalTokenUsage: null,
             promptTokenUsage: null,
@@ -1465,7 +1482,7 @@ export class CodexAcpServer {
             account: authState.account,
             authConfigured: authState.authConfigured,
             authProvider: authProvider,
-            cwd: request.cwd,
+            cwd: sessionMetadata.cwd ?? request.cwd,
             additionalDirectories: sessionMetadata.additionalDirectories,
             mcpServers: requestedMcpServers,
             fastModeEnabled: serviceTierEnablesFast(sessionMetadata.currentServiceTier),
@@ -1483,14 +1500,16 @@ export class CodexAcpServer {
             toolCallReports: this.clientDelivery.reports,
             openToolCalls: new CodexSessionToolCalls(),
         };
-        sessionState.cwd = sessionMetadata.cwd ?? request.cwd;
-        sessionState.titleGen = new TitleGenerator(
-            this.codexAcpClient.appServerClient,
-            sessionId,
-            sessionState.cwd,
-            () => sessionState.sessionTitleSource,
-            this.sessionIndex.titleWriter(sessionId),
-        );
+        // A follow-up in an existing thread must preserve its shared title.
+        if (operation !== "resume") {
+            sessionState.titleGen = new TitleGenerator(
+                this.codexAcpClient.appServerClient,
+                sessionId,
+                sessionState.cwd,
+                () => sessionState.sessionTitleSource,
+                this.sessionIndex.titleWriter(sessionId),
+            );
+        }
         sessionState.promptSuggestions = this.createPromptSuggestions(sessionState);
         this.installSessionState(sessionState, sessionMetadata.threadStatus);
         AcpV2Connection.of(this.connection)?.restoreForegroundState(sessionId, sessionMetadata.threadStatus?.type === "active");
@@ -1508,9 +1527,13 @@ export class CodexAcpServer {
             try {
                 await this.streamThreadHistory(sessionId, snapshot, history);
             } catch (error) {
+                settleTrackerReady?.(null);
                 if (error instanceof SessionClosedDuringLoadError) {
                     throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
                 }
+                await this.closeSessionInternal({sessionId}, "detach").catch(detachError => {
+                    logger.error(`Failed to detach session ${sessionId} after a failed history read`, detachError);
+                });
                 throw error;
             }
             assertCurrent();
@@ -1532,7 +1555,7 @@ export class CodexAcpServer {
                     await startupWait;
                 } catch (err) {
                     // The session is installed already. A failed wait closes it, so the client never gets a half-open session.
-                    await this.closeSession({sessionId}).catch(closeError => {
+                    await this.closeSessionInternal({sessionId}, "detach").catch(closeError => {
                         logger.error(`Failed to close session ${sessionId} after a failed MCP startup wait`, closeError);
                     });
                     throw err;
@@ -1743,12 +1766,14 @@ export class CodexAcpServer {
             sessionId,
             async (event) => {
                 const sessionState = await ready;
-                if (!sessionState) return;
+                if (!sessionState || this.sessions.get(sessionId) !== sessionState || this.sessionIsClosing(sessionId)
+                    || client !== this.codexAcpClient) return;
                 const bridge = this.currentSessionEventBridge(sessionId, client);
                 if (bridge?.sessionState === sessionState) {
                     await this.dispatchSessionNotification(sessionId, client, event);
                     return;
                 }
+                if (isOlderRootTurnCompletion(sessionState, event)) return;
                 if (!baselineEventHandler) {
                     baselineEventHandler = new CodexEventHandler(
                         this.connection,
@@ -2012,25 +2037,22 @@ export class CodexAcpServer {
         } = await this.getOrCreateSessionWithHistory(params, generation);
 
         try {
-            try {
-                await this.streamThreadHistory(sessionId, thread, history);
-            } finally {
-                // Only after replay is fully streamed does the baseline tracker start dispatching
-                // live events, so a live goal-turn frame can never race ahead of history.
-                settleTrackerReady(sessionState);
-            }
+            await this.streamThreadHistory(sessionId, thread, history);
         } catch (err) {
+            settleTrackerReady(null);
             // A close during the load already closed the session.
             if (err instanceof SessionClosedDuringLoadError) {
                 throw RequestError.invalidRequest(`Session ${sessionId} is closing`);
             }
             // The history pages are read after the session is installed, so a failed read closes the
             // session again. The client never gets a half-open session.
-            await this.closeSession({sessionId}).catch(closeError => {
+            await this.closeSessionInternal({sessionId}, "detach").catch(closeError => {
                 logger.error(`Failed to close session ${sessionId} after a failed history read`, closeError);
             });
             throw this.recovery?.mapError(err) ?? err;
         }
+        // Let the startup tracker dispatch live events once replay has finished.
+        settleTrackerReady(sessionState);
         await this.getSessionState(sessionId).asyncTasks.reconcile();
         // A load response means "the replay is complete"; a late rename echo
         // from a still-running title generation would arrive after it.
@@ -2098,6 +2120,7 @@ export class CodexAcpServer {
             release();
             if (this.sessionNotificationPauses.get(sessionId) === pause) {
                 this.sessionNotificationPauses.delete(sessionId);
+                if (this.sessionOpenGenerations.get(sessionId) === generation) this.sessionOpenGenerations.delete(sessionId);
             }
         }
     }
@@ -2189,6 +2212,10 @@ export class CodexAcpServer {
     }
 
     async closeSession(params: acp.CloseSessionRequest): Promise<acp.CloseSessionResponse> {
+        return this.closeSessionInternal(params, "close");
+    }
+
+    private async closeSessionInternal(params: acp.CloseSessionRequest, action: "close" | "detach"): Promise<acp.CloseSessionResponse> {
         logger.log("Closing session...", {sessionId: params.sessionId});
         if (!this.hasLocalSession(params.sessionId)) {
             this.finishSessionDelivery(params.sessionId, []);
@@ -2214,7 +2241,7 @@ export class CodexAcpServer {
             // Same as `session/cancel`: drop every v2 prompt still queued for this session first.
             this.cancelQueuedV2Prompts(params.sessionId);
             if (sessionState) {
-                await this.interruptSessionTurn(sessionState, "Close", true);
+                if (action === "close") await this.interruptSessionTurn(sessionState, "Close", true);
                 sessionState.promptSuggestions?.invalidate();
             } else {
                 logger.log("Close request received for unknown local session", {sessionId: params.sessionId});
@@ -2226,18 +2253,23 @@ export class CodexAcpServer {
                 await activePrompt.completion;
             }
 
+            if (action === "detach") closeGeneration = this.bumpSessionGeneration(params.sessionId);
             if (this.recovery === null || this.recovery.isReady() && (!sessionState || this.recovery.sessionIsLive(sessionState))) {
-                await this.runWithProcessCheck(() => this.codexAcpClient.closeSession(params.sessionId));
+                await this.runWithProcessCheck(() => action === "close"
+                    ? this.codexAcpClient.closeSession(params.sessionId)
+                    : this.codexAcpClient.detachSession(params.sessionId));
             } else {
                 // The thread is not loaded in a running app-server: nothing to close there, and no restart for it.
                 logger.log("Session closed without an app-server call: its app-server is gone", {sessionId: params.sessionId});
             }
-            closeGeneration = this.bumpSessionGeneration(params.sessionId);
+            closeGeneration ??= this.bumpSessionGeneration(params.sessionId);
             if (sessionState) {
                 if (sessionState.subagents instanceof StandardSubagentEventRouter) await sessionState.subagents.finishOutstanding("disconnected");
-                await sessionState.asyncTasks.finishAll("stopped");
             }
-            await this.reportCodexTurnState(params.sessionId, {state: "idle", stopReason: "cancelled"});
+            if (action === "close") {
+                await sessionState?.asyncTasks.finishAll("stopped");
+                await this.reportCodexTurnState(params.sessionId, {state: "idle", stopReason: "cancelled"});
+            }
             logger.log("Session closed", {sessionId: params.sessionId});
         } finally {
             if (closeGeneration !== null && this.getSessionGeneration(params.sessionId) === closeGeneration) {
@@ -3714,14 +3746,7 @@ export class CodexAcpServer {
             }
             knownAccount = await settledWithin(authorization, graceLeftMs());
         } catch (err) {
-            settleTrackerReady(!subscribed && this.instructionUpdates.has(request.sessionId)
-                ? this.sessions.get(request.sessionId) ?? null : null);
-            if (subscribed) {
-                await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
-            } else {
-                // A rejected instruction change keeps the original session's event delivery.
-                this.restoreExistingSessionTracker(request.sessionId);
-            }
+            await this.rollbackSessionOpen(request.sessionId, requestedSessionGeneration, subscribed, settleTrackerReady);
             throw err;
         }
 
@@ -3731,10 +3756,7 @@ export class CodexAcpServer {
         try {
             authState = await this.getAuthStateForProvider(authProvider, knownAccount === "pending" ? "unavailable" : knownAccount);
         } catch (err) {
-            settleTrackerReady(null);
-            if (subscribed) {
-                await this.cleanupStaleSessionOpen(request.sessionId, requestedSessionGeneration);
-            }
+            await this.rollbackSessionOpen(request.sessionId, requestedSessionGeneration, subscribed, settleTrackerReady);
             throw err;
         }
         if (!this.sessionOpenCanInstall(sessionId, requestedSessionGeneration)) {
@@ -3764,7 +3786,7 @@ export class CodexAcpServer {
             collaborationMode: sessionMetadata.collaborationMode,
             currentTurnId: sessionMetadata.activeTurnId ?? null,
             interruptTurnId: null,
-            codexReportedRunningTurnId: null,
+            codexReportedRunningTurnId: sessionMetadata.activeTurnId ?? null,
             lastTokenUsage: null,
             totalTokenUsage: null,
             promptTokenUsage: null,
@@ -3775,7 +3797,7 @@ export class CodexAcpServer {
             account: authState.account,
             authConfigured: authState.authConfigured,
             authProvider: authProvider,
-            cwd: request.cwd,
+            cwd: sessionMetadata.cwd ?? request.cwd,
             additionalDirectories: sessionMetadata.additionalDirectories,
             mcpServers: requestedMcpServers,
             fastModeEnabled: serviceTierEnablesFast(sessionMetadata.currentServiceTier),
@@ -3793,14 +3815,6 @@ export class CodexAcpServer {
             toolCallReports: this.clientDelivery.reports,
             openToolCalls: new CodexSessionToolCalls(),
         };
-        sessionState.cwd = sessionMetadata.cwd ?? request.cwd;
-        sessionState.titleGen = new TitleGenerator(
-            this.codexAcpClient.appServerClient,
-            sessionId,
-            sessionState.cwd,
-            () => sessionState.sessionTitleSource,
-            this.sessionIndex.titleWriter(sessionId),
-        );
         sessionState.promptSuggestions = this.createPromptSuggestions(sessionState);
         this.installSessionState(sessionState, thread.status);
         AcpV2Connection.of(this.connection)?.restoreForegroundState(sessionId, thread.status.type === "active");
@@ -4150,7 +4164,6 @@ export class CodexAcpServer {
         if (explicitTitle) {
             sessionState.sessionTitle = explicitTitle;
             sessionState.sessionTitleSource = "explicit";
-            sessionState.titleGen?.markExistingTitle();
             await session.update({
                 sessionUpdate: "session_info_update",
                 title: explicitTitle,
@@ -4244,6 +4257,8 @@ export class CodexAcpServer {
 
     private async createHistoryUpdates(item: ThreadItem, sessionState: SessionState): Promise<UpdateSessionEvent[]> {
         const renderer = new AcpToolCallRenderer(sessionState.clientCapabilities);
+        const render = (facts: ToolFacts) => projectReplayLocations(renderer.render(facts), this.replayFileMap);
+        const zed = this.clientInfo?.name === "zed" && !renderer.capabilities.airClient;
         switch (item.type) {
             case "userMessage":
                 return this.createUserMessageUpdates(item);
@@ -4252,7 +4267,7 @@ export class CodexAcpServer {
             case "sleep":
                 return [];
             case "subAgentActivity":
-                return [renderer.render(SubagentActivityReporter.activity(item, "completed", "start"))];
+                return [render(SubagentActivityReporter.activity(item, "completed", "start"))];
             case "agentMessage": {
                 const meta = createCodexMessageMeta(item.phase, item.memoryCitation, sessionState.clientCapabilities.airClient);
                 return [{
@@ -4265,21 +4280,26 @@ export class CodexAcpServer {
             case "reasoning":
                 return this.createReasoningUpdates(item);
             case "fileChange":
-                return [renderer.render(FileChangeReporter.started(item, renderer.capabilities.diffPatchFormat))];
-            case "commandExecution":
-                return CommandReporter.history(item).map(facts => renderer.render(facts));
+                return [render(FileChangeReporter.started(item, renderer.capabilities.diffPatchFormat))];
+            case "commandExecution": {
+                const compact = zed && renderer.capabilities.terminalOutputKey(false) === null;
+                return CommandReporter.history(item, compact).map(render);
+            }
             case "mcpToolCall":
-                return [renderer.render(McpToolReporter.started(item))];
+                return [render(McpToolReporter.started(item))];
             case "dynamicToolCall":
-                return [renderer.render(DynamicToolReporter.started(item))];
+                return [render(DynamicToolReporter.started(item))];
             case "collabAgentToolCall":
-                return [renderer.render(CollabAgentReporter.started(item))];
+                return [render(CollabAgentReporter.started(item))];
             case "webSearch":
-                return [renderer.render(WebSearchReporter.history(item))];
+                return [render(WebSearchReporter.history(item))];
             case "imageView":
-                return [renderer.render(ImageViewReporter.viewed(item))];
+                return [renderer.render(ImageViewReporter.history(item, this.replayFileMap?.get(item.path), {
+                    fileUri: zed || this.protocolVersion === 2,
+                    linkOnly: zed,
+                }))];
             case "imageGeneration":
-                return [renderer.render(ImageGenerationReporter.whole(item))];
+                return [render(ImageGenerationReporter.whole(item))];
             case "enteredReviewMode":
                 return [this.createReviewModeUpdate(item, true)];
             case "exitedReviewMode":
@@ -4287,7 +4307,7 @@ export class CodexAcpServer {
             case "contextCompaction":
                 return [clientSupportsCompaction(this.clientCapabilities)
                     ? createCompactionUpdate(item.id, "completed")
-                    : renderer.render(CompactionReporter.history(item))];
+                    : render(CompactionReporter.history(item))];
             case "plan":
                 return item.text.length > 0 ? [this.createPlanHistoryUpdate(item)] : [];
         }
@@ -4308,7 +4328,7 @@ export class CodexAcpServer {
             const nativePath = input.type === "localImage" || input.type === "localAudio" || input.type === "mention"
                 ? input.path
                 : (input.type === "image" || input.type === "audio") && "url" in input ? input.url : null;
-            if (nativePath !== null && attachmentUris.has(attachmentFileUri(nativePath) ?? "")) continue;
+            if (nativePath !== null && attachmentUris.has(fileUriFromPath(nativePath) ?? "")) continue;
             const blocks = contentBlocks[index]!;
             for (const block of blocks) {
                 updates.push(createUserMessageChunk(block, messageId));
@@ -4380,7 +4400,7 @@ export class CodexAcpServer {
             case "localImage":
             case "localAudio":
             case "mention": {
-                const uri = attachmentFileUri(input.path);
+                const uri = fileUriFromPath(input.path);
                 const fileName = input.path.split(/[\\/]/).pop() || input.type;
                 const name = input.type === "mention" && input.name.trim().length > 0 ? input.name : fileName;
                 return uri !== null
@@ -4530,6 +4550,7 @@ export class CodexAcpServer {
         const bridge = this.currentSessionEventBridge(sessionId, client);
         if (!bridge) return;
         const {sessionState, eventHandler} = bridge;
+        if (isOlderRootTurnCompletion(sessionState, event)) return;
         await this.trackCodexForegroundWork(sessionState, event);
         await this.trackSteerLanding(sessionState, event);
         this.handleSkillsChanged(sessionState, event);

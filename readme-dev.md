@@ -5,7 +5,17 @@ The managed daemon can already be running a different version from the proxy exe
 
 Session loads stream history through the app-server's history cursors and paginated item API. Resuming an active thread also restores its turn snapshot through the paginated turn/item APIs. Live notifications wait behind history replay and then continue through the session's persistent event bridge. Legacy threads use `thread/read` history. A closed proxy rejects pending operations so the client can reconnect and reopen the persisted session.
 
+Load and resume use the working directory saved by Codex. Equivalent path spellings and symlink aliases are accepted. A different working directory fails with `-32602` and returns the saved `cwd` in the error data. This check also applies when the adapter reconnects a session after a restart.
+
+A failed setup preserves an existing attachment while its session state is still installed. If setup has already installed a replacement state, a replay failure releases this adapter's attachment and leaves runtime work on the shared thread running. An explicit `session/close` stops the session's active turn and background work.
+
+Automatic titles are generated for new and forked ACP sessions. When opening an existing thread, the adapter displays its saved title or an earlier prompt without creating a new saved title from a follow-up. An explicit `session/set_title` still renames the shared thread.
+
 ### Remote-control diagnostics
+
+Mobile conversations on the same Codex host are available through ACP `session/list` and can be resumed by their original session ID. The standard list orders conversations by their last update. A native project filter applies before pagination. For paths imported from another OS, follow `nextCursor` even if an individual page has no matches.
+
+Zed 1.29 keeps its project sidebar in a separate desktop database. In stock Zed, open the thread archive and choose **Import Threads** for the Codex agent. Imports start in the archive. Open the conversation there to restore it to the project sidebar. [Zed's ACP import](https://github.com/zed-industries/zed/blob/d01b134cddf5e4f71964deb2d6f81cdb38fcf1e7/crates/agent_ui/src/thread_import.rs#L794-L889)
 
 `npm run test:remote-sync` runs an opt-in live test (`RUN_REMOTE_SYNC_TESTS=true`) against the existing managed daemon and authentication. It creates a separate test thread, exchanges local and remote prompts, steers during a six-second command, and compares both live transcripts with a fresh ACP history replay. It prints input acceptance, message materialization, and ACP forwarding timings. Cleanup disconnects only the test's proxies; it never restarts or stops the daemon or existing sessions. The test consumes model tokens and leaves its named test thread available for inspection. `CODEX_PATH` can select the proxy executable.
 
@@ -18,6 +28,7 @@ A successful `turn/steer` acknowledges input acceptance, not immediate transcrip
 - `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency. The same executable is used for `remote-control start` and `app-server proxy`.
 - `CODEX_CONFIG` - JSON object merged into the Codex session config. `hooks` move to App Server startup (`-c hooks=...`) for AIR review; Codex rejects malformed hooks at startup and `initialize` reports its error.
 - `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
+- `CODEX_ACP_REPLAY_FILE_MAP` - path to a JSON object that maps exact absolute POSIX or Windows tool-call paths to replacement absolute paths. A `null` value clears the location and turns a matching image link into a text label. The adapter reads the map once at startup and applies it only to history replay. It keeps recorded titles, tool inputs, outputs, and diffs. A missing or invalid map uses the recorded paths.
 - `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.
 - `INITIAL_AGENT_MODE` - initial mode id: `read-only`, `workspace-write`, `agent`, `agent-full-access`, or `permission-profile:<profile-id>`. See [permission profile selection](docs/permission-profiles.md).
 - `NO_BROWSER` - hide browser-based ChatGPT auth when set.

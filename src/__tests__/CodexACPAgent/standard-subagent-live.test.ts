@@ -220,6 +220,11 @@ describe.each([1, 2] as const)("ACP v%s live standard subagents", version => {
         await load();
         await flush(h);
         expect(resumes).toEqual(parent === sessionId ? [sessionId, worker] : [sessionId]);
+        if (parent === sessionId) {
+            // The verified child's configuration is published asynchronously after the load response.
+            await vi.waitFor(() => expect(childUpdates().some(({update}) =>
+                update.sessionUpdate === "subagent_update" && update.cwd === cwd)).toBe(true));
+        }
         h.emit(onWorker(turnStarted("child-turn")));
         await flush(h);
         if (parent === sessionId) expect(await approval("restored")).toEqual({decision: "accept"});

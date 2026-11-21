@@ -1,4 +1,5 @@
 import {afterEach, describe, expect, it, vi} from 'vitest';
+import {realpathSync} from 'node:fs';
 import * as acp from '@agentclientprotocol/sdk/unstable';
 import * as acpV2 from '@agentclientprotocol/sdk/experimental/v2/unstable';
 import {createAcpAgentRouter} from '../../AcpAgentRouter';
@@ -84,7 +85,7 @@ function codexResponse(method: string, replayTurns: Thread["turns"] = [], thread
         case "config/read":
             return {config: {}, origins: {}, layers: []};
         case "thread/list":
-            return {data: [createThread()], nextCursor: null};
+            return {data: [createThread(thread)], nextCursor: null};
         case "thread/backgroundTerminals/list":
             return {data: [], nextCursor: null};
         case "thread/goal/get":
@@ -432,12 +433,14 @@ describe('Session lifecycle over ACP v2', () => {
     });
 
     it('lists sessions', async () => {
-        const {connection, codexRequests} = await connectV2Client();
+        const projectCwd = realpathSync.native(".");
+        const {connection, codexRequests} = await connectV2Client({thread: {cwd: projectCwd}});
         closeClient = () => connection.close();
 
-        const response = await connection.agent.request(acpV2.methods.agent.session.list, {cwd});
+        const response = await connection.agent.request(acpV2.methods.agent.session.list, {cwd: projectCwd});
 
-        await expect(dump({response, codexRequests})).toMatchFileSnapshot('data/session-lifecycle-v2-list.json');
+        const transcript = dump({response, codexRequests}).replaceAll(JSON.stringify(projectCwd), JSON.stringify(cwd));
+        await expect(transcript).toMatchFileSnapshot('data/session-lifecycle-v2-list.json');
     });
 
     it('closes a session', async () => {
@@ -480,6 +483,22 @@ describe('Session lifecycle over ACP v2', () => {
 
         await expect(dump({response, codexRequests, updates: sessionUpdates}))
             .toMatchFileSnapshot(snapshot);
+    });
+
+    it.each([null, {type: "start"} as const])('uses the saved cwd on resume with replayFrom %j', async replayFrom => {
+        const {connection, agent, codexRequests} = await connectV2Client();
+        closeClient = () => connection.close();
+        const resume = (dir: string) => connection.agent.request(acpV2.methods.agent.session.resume, {
+            sessionId, cwd: dir, replayFrom,
+        });
+
+        await expect(resume("/another-project")).rejects.toMatchObject({code: -32602, data: {cwd}});
+        expect(codexRequests).toEqual([]);
+        expect(() => agent().getSessionState(sessionId)).toThrow();
+        await resume(`${cwd}/.`);
+        expect(agent().getSessionState(sessionId).cwd).toBe(cwd);
+        expect(codexRequests).toHaveLength(1);
+        expect(codexRequests[0]!.params).not.toHaveProperty("cwd");
     });
 
     it.each([

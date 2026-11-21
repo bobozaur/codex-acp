@@ -7,6 +7,7 @@ import {CodexAcpClient} from '../../CodexAcpClient';
 import {CodexAppServerClient} from '../../CodexAppServerClient';
 import {AIR_NATIVE_SUBAGENT_SESSIONS_KEY} from '../../AirExtension';
 import type {Thread} from '../../app-server/v2';
+import type {ReplayFileMap} from '../../ReplayFileMap';
 import {createCodexMockTestFixture, createTestModel} from '../acp-test-utils';
 import {createMockConnections} from './test-utils';
 import {commandExecutionItem, createTurn} from './v2-prompt-harness';
@@ -217,6 +218,8 @@ async function connectV2Client(options?: {
     replayTurns?: Thread["turns"];
     capabilities?: acpV2.ClientCapabilities;
     paginated?: boolean;
+    clientName?: string;
+    replayFileMap?: ReplayFileMap;
 }) {
     const mocks = createMockConnections();
     mocks.mockCodexConnection.sendRequest.mockImplementation(async (method: string, params?: any) => (
@@ -227,7 +230,8 @@ async function connectV2Client(options?: {
     vi.spyOn(codexAcpClient, "getAgentConfiguredModelProvider").mockResolvedValue("openai");
     vi.spyOn(codexAcpClient, "getAccount").mockResolvedValue({account: null, requiresOpenaiAuth: false});
     vi.spyOn(codexAcpClient, "awaitMcpServerStartup").mockResolvedValue({ready: [], failed: [], cancelled: []});
-    const router = createAcpAgentRouter((connection) => new CodexAcpServer(connection, codexAcpClient));
+    const router = createAcpAgentRouter((connection) =>
+        new CodexAcpServer(connection, codexAcpClient, undefined, undefined, undefined, undefined, options?.replayFileMap));
     const clientToAgent = new TransformStream<Uint8Array, Uint8Array>();
     const agentToClient = new TransformStream<Uint8Array, Uint8Array>();
     router.connect(acp.ndJsonStream(agentToClient.writable, clientToAgent.readable));
@@ -241,7 +245,7 @@ async function connectV2Client(options?: {
         .connect(acp.ndJsonStream(clientToAgent.writable, agentToClient.readable));
     await connection.agent.request(acpV2.methods.agent.initialize, {
         protocolVersion: 2,
-        info: {name: "test-client", version: "1.0.0"},
+        info: {name: options?.clientName ?? "test-client", version: "1.0.0"},
         ...(options?.capabilities ? {capabilities: options.capabilities} : {}),
     });
     const codexMethods = () => mocks.mockCodexConnection.sendRequest.mock.calls.map((call: unknown[]) => call[0] as string);
@@ -292,6 +296,147 @@ function messageIdSequence(updates: acpV2.UpdateSessionNotification[]): Array<[s
         .filter(({update}) => "messageId" in update)
         .map(({update}) => [update.sessionUpdate, (update as {messageId?: string | null}).messageId]);
 }
+
+describe('History replay locations and Zed tool reports', () => {
+    const oldImage = String.raw`C:\previous\image #1.png`;
+    const missingImage = "/previous/missing.png";
+    const relativeImage = "legacy/screen.png";
+    const mappedImage = "/workspace/image %1.png";
+    const oldReadPath = "/workspace/test.txt";
+    const mappedReadPath = "/restored/test.txt";
+    const replayFileMap = new Map<string, string | null>([
+        [oldImage, mappedImage], [missingImage, null], [oldReadPath, mappedReadPath],
+    ]);
+    const replayTurns: Thread["turns"] = [{
+        ...createTurn("completed"),
+        itemsView: "full",
+        items: [
+            {
+                ...commandExecutionItem("read", "completed"),
+                command: "cat /workspace/test.txt",
+                commandActions: [{type: "read", command: "cat /workspace/test.txt", name: "test.txt", path: oldReadPath}],
+                aggregatedOutput: "Recorded read output",
+            },
+            {
+                ...commandExecutionItem("search", "failed"),
+                command: "rg absent",
+                commandActions: [{type: "search", command: "rg absent", query: "absent", path: null}],
+                aggregatedOutput: "",
+                exitCode: 1,
+            },
+            {
+                ...commandExecutionItem("list", "completed"),
+                command: "ls",
+                commandActions: [{type: "listFiles", command: "ls", path: null}],
+                aggregatedOutput: "test.txt",
+            },
+            {...commandExecutionItem("terminal", "completed"), aggregatedOutput: "Recorded terminal output"},
+            {type: "imageView", id: "image", path: oldImage},
+            {type: "imageView", id: "missing-image", path: missingImage},
+            {type: "imageView", id: "relative-image", path: relativeImage},
+        ],
+    }];
+
+    it.each([true, false])('preserves command and image replay on v1 with terminal_output=%s', async terminalOutput => {
+        const replay = async (clientName: string, paths?: ReplayFileMap) => {
+            const fixture = createCodexMockTestFixture();
+            const client = fixture.getCodexAcpClient();
+            const agent = new CodexAcpServer(fixture.getAcpConnection(), client, undefined, undefined, undefined, undefined, paths);
+            const appServer = fixture.getCodexAppServerClient();
+            client.readAuthRequirement = vi.fn().mockResolvedValue({required: false, account: null});
+            client.getAccount = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: false});
+            client.listSkills = vi.fn().mockResolvedValue({data: []});
+            const model = createTestModel();
+            appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+            appServer.threadResume = vi.fn().mockResolvedValue({
+                thread: createThread(),
+                model: model.id,
+                modelProvider: "openai",
+                cwd,
+                approvalPolicy: "never",
+                sandbox: {type: "dangerFullAccess"},
+                reasoningEffort: model.defaultReasoningEffort,
+            });
+            appServer.threadRead = vi.fn().mockResolvedValue({thread: createThread()});
+            appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: createThread({turns: replayTurns})});
+            await agent.initialize({
+                protocolVersion: 1,
+                clientInfo: {name: clientName, version: "1.0.0"},
+                clientCapabilities: {_meta: terminalOutput ? {terminal_output: true} : {terminal_output_delta: true}},
+            });
+            await agent.loadSession({sessionId, cwd, mcpServers: []});
+            return fixture.getAcpConnectionEvents([])
+                .filter(({method}) => method === "sessionUpdate")
+                .map(({args}) => args[0].update as acp.SessionNotification["update"])
+                .filter(update => update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update");
+        };
+
+        const base = await replay("test-client");
+        const zed = await replay("zed", new Map([[oldReadPath, mappedReadPath]]));
+        const compacted = terminalOutput ? new Set(["read", "search", "list"]) : new Set<string>();
+        expect(zed).toHaveLength(base.length - compacted.size);
+        expect(zed).toEqual(base.flatMap<unknown>((report, index) => {
+            const mapped = report.toolCallId === "read" && report.sessionUpdate === "tool_call"
+                ? {...report, locations: [{path: mappedReadPath}]}
+                : report;
+            if (compacted.has(report.toolCallId)) {
+                if (report.sessionUpdate === "tool_call_update") return [];
+                return [{...mapped, ...base[index + 1], sessionUpdate: "tool_call"}];
+            }
+            if (report.toolCallId === "image" || report.toolCallId === "missing-image") {
+                const [path, uri] = report.toolCallId === "image"
+                    ? [oldImage, "file:///C:/previous/image%20%231.png"]
+                    : [missingImage, "file:///previous/missing.png"];
+                return [{
+                    ...report,
+                    locations: [],
+                    content: [{type: "content", content: {type: "resource_link", name: path, uri}}],
+                }];
+            }
+            if (report.toolCallId === "relative-image") {
+                return [{...report, locations: [], content: [{type: "content", content: {type: "text", text: relativeImage}}]}];
+            }
+            return [mapped];
+        }));
+        expect(zed.filter(report => report.toolCallId === "terminal").map(report => report.sessionUpdate))
+            .toEqual(["tool_call", "tool_call_update"]);
+    });
+
+    it.each([
+        {clientName: "zed", locations: []},
+        {clientName: "test-client", locations: [{path: mappedImage}]},
+    ])('replays mapped and unavailable images for $clientName on v2', async ({clientName, locations}) => {
+        const {connection, updates} = await connectV2Client({clientName, replayTurns, replayFileMap});
+        try {
+            await connection.agent.request(acpV2.methods.agent.session.resume, {sessionId, cwd, replayFrom: {type: "start"}});
+            const tools = updates.map(({update}) => update).filter(acpV2.SessionUpdate.isToolCallUpdate);
+            const active = tools.filter(tool => ["image", "missing-image", "relative-image"].includes(tool.toolCallId));
+            expect(active).toMatchObject([
+                {
+                    toolCallId: "image", title: `View Image ${oldImage}`, locations, rawInput: {path: oldImage},
+                    content: [{type: "content", content: {type: "resource_link", name: oldImage, uri: "file:///workspace/image%20%251.png"}}],
+                },
+                {
+                    toolCallId: "missing-image", title: `View Image ${missingImage}`, locations: [], rawInput: {path: missingImage},
+                    content: [{type: "content", content: {type: "text", text: missingImage}}],
+                },
+                {
+                    toolCallId: "relative-image", title: `View Image ${relativeImage}`, locations: [], rawInput: {path: relativeImage},
+                    content: [{type: "content", content: {type: "text", text: relativeImage}}],
+                },
+            ]);
+            const read = tools.filter(tool => tool.toolCallId === "read");
+            expect(read[0]).toMatchObject({status: "completed", locations: [{path: mappedReadPath}]});
+            expect(read).toHaveLength(clientName === "zed" ? 1 : 2);
+            expect(read.at(-1)).toMatchObject({rawOutput: {exit_code: 0},
+                content: [{type: "content", content: {type: "text", text: "Recorded read output"}}],
+            });
+        } finally {
+            connection.close();
+            expectConformingV2SessionUpdates();
+        }
+    });
+});
 
 describe('ACP v2 resume replay: review-mode ids, reviewer-prompt hiding, primers', () => {
     let closeClient: (() => void) | null = null;
@@ -402,6 +547,7 @@ describe('ACP v2 resume replay: review-mode ids, reviewer-prompt hiding, primers
             sandbox: {type: "dangerFullAccess"},
             reasoningEffort: model.defaultReasoningEffort,
         });
+        appServer.threadRead = vi.fn().mockResolvedValue({thread: createThread()});
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({
             thread: createThread({turns: reviewReplayTurns}),
         });
@@ -546,6 +692,7 @@ describe('resume replay of Codex file citations', () => {
             sandbox: {type: "dangerFullAccess"},
             reasoningEffort: model.defaultReasoningEffort,
         });
+        appServer.threadRead = vi.fn().mockResolvedValue({thread: createThread()});
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: createThread({turns: citationTurns})});
 
         await agent.initialize({protocolVersion: 1});
@@ -616,6 +763,7 @@ describe('resume replay of async question answers', () => {
             sandbox: {type: "dangerFullAccess"},
             reasoningEffort: model.defaultReasoningEffort,
         });
+        appServer.threadRead = vi.fn().mockResolvedValue({thread: createThread()});
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: createThread({turns: answerTurns})});
 
         await agent.initialize({protocolVersion: 1});

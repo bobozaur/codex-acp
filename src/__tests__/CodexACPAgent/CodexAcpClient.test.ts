@@ -633,7 +633,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 nextCursor: null,
             });
         const threadResponse = {
-            thread: {id: "thread-id", turns: [], status: {type: "idle"}},
+            thread: {id: "thread-id", cwd: "/workspace", turns: [], status: {type: "idle"}},
             model: "gpt-5",
             modelProvider: "openai",
             reasoningEffort: "medium",
@@ -644,6 +644,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         };
         vi.spyOn(codexAppServerClient, "threadStart").mockResolvedValue(threadResponse as any);
         vi.spyOn(codexAppServerClient, "threadResume").mockResolvedValue(threadResponse as any);
+        vi.spyOn(codexAppServerClient, "threadRead").mockResolvedValue({thread: threadResponse.thread} as any);
         vi.spyOn(codexAppServerClient, "threadFork").mockResolvedValue(threadResponse as any);
         vi.spyOn(codexAppServerClient, "threadReadWithHistory").mockResolvedValue({thread: threadResponse.thread} as any);
         vi.spyOn(codexAppServerClient, "listModels").mockResolvedValue({
@@ -701,6 +702,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 
         vi.spyOn(codexAppServerClient, "skillsExtraRootsSet").mockResolvedValue(undefined);
         vi.spyOn(codexAppServerClient, "listSkills").mockResolvedValue({data: []});
+        vi.spyOn(codexAppServerClient, "threadRead").mockImplementation(async ({threadId}) => ({thread: {id: threadId, cwd: "/workspace"}} as any));
         const threadResumeSpy = vi.spyOn(codexAppServerClient, "threadResume").mockResolvedValue({
             thread: {id: "thread-id"} as any,
             model: "gpt-5",
@@ -738,7 +740,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             "/workspace": {trust_level: "trusted"},
             "/workspace/load-extra": {trust_level: "trusted"},
         });
-        expect(threadReadSpy).toHaveBeenCalledWith("thread-id");
+        expect(threadReadSpy).toHaveBeenCalledWith("thread-id", {id: "thread-id"});
     });
 
     it('forks an ACP session through thread/fork with the requested workspace', async () => {
@@ -890,6 +892,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         vi.spyOn(codexAcpClient, "getAccount").mockResolvedValue({account: null, requiresOpenaiAuth: false});
         vi.spyOn(codexAppServerClient, "skillsExtraRootsSet").mockResolvedValue(undefined);
         vi.spyOn(codexAppServerClient, "listSkills").mockResolvedValue({data: []});
+        vi.spyOn(codexAppServerClient, "threadRead").mockImplementation(async ({threadId}) => ({thread: {id: threadId, cwd: "/workspace"}} as any));
         // Codex sends no thread/settings/updated on a resume. Only the response holds the mode.
         vi.spyOn(codexAppServerClient, "threadResume").mockImplementation(async ({threadId}) => ({
             thread: {id: threadId},
@@ -951,6 +954,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 model_provider: "azure",
             },
         } as any);
+        vi.spyOn(codexAppServerClient, "threadRead").mockImplementation(async ({threadId}) => ({thread: {id: threadId, cwd: "/workspace"}} as any));
         const threadResumeSpy = vi.spyOn(codexAppServerClient, "threadResume").mockResolvedValue({
             thread: {id: "thread-id"} as any,
             model: "gpt-5",
@@ -997,6 +1001,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 model_provider: "azure",
             },
         } as any);
+        vi.spyOn(codexAppServerClient, "threadRead").mockImplementation(async ({threadId}) => ({thread: {id: threadId, cwd: "/workspace"}} as any));
         const threadResumeSpy = vi.spyOn(codexAppServerClient, "threadResume").mockResolvedValue({
             thread: {id: "thread-id"} as any,
             model: "gpt-5",
@@ -1398,7 +1403,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         expect(session.sessionId).toBe("new-id");
     });
 
-    it('closes the session when the MCP startup wait fails', async () => {
+    it('detaches the session when the MCP startup wait fails', async () => {
         const mockFixture = createCodexMockTestFixture();
         const codexAcpAgent = mockFixture.getCodexAcpAgent();
         const codexAcpClient = mockFixture.getCodexAcpClient();
@@ -1415,7 +1420,9 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             additionalDirectories: [],
         });
         vi.spyOn(codexAcpClient, "awaitMcpServerStartup").mockRejectedValue(new Error("app-server exited"));
-        const closeSpy = vi.spyOn(codexAcpClient, "closeSession").mockResolvedValue(undefined as never);
+        const appServer = mockFixture.getCodexAppServerClient();
+        const unsubscribe = vi.spyOn(appServer, "threadUnsubscribe");
+        const listBackgroundTerminals = vi.spyOn(appServer, "threadBackgroundTerminalsList");
 
         await expect(codexAcpAgent.newSession({
             cwd: "/workspace",
@@ -1423,7 +1430,8 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             _meta: {mcpStartupAwaitTimeoutMs: 5_000},
         })).rejects.toThrow("app-server exited");
 
-        expect(closeSpy).toHaveBeenCalledWith("new-id");
+        expect(unsubscribe).toHaveBeenCalledExactlyOnceWith({threadId: "new-id"});
+        expect(listBackgroundTerminals).not.toHaveBeenCalled();
         expect(() => codexAcpAgent.getSessionState("new-id")).toThrow();
     });
 
@@ -2022,7 +2030,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 
         await expect(
             fixture.getCodexAcpAgent().resumeSession({cwd: "", sessionId: sessionId})
-        ).rejects.toThrow("invalid session id");
+        ).rejects.toThrow("invalid thread id");
     });
 
     it('should return available builtin commands', async () => {

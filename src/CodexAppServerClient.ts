@@ -872,17 +872,19 @@ export class CodexAppServerClient {
             limit: 1,
             sortDirection: "desc",
         }), "thread/items/list", threadId);
-        const lastItemId = last.data[0]?.item.id;
-        if (lastItemId === undefined) return;
+        const boundary = last.data[0];
+        if (boundary === undefined) return;
+        const atBoundary = (entry: ThreadItemEntry): boolean =>
+            entry.turnId === boundary.turnId && entry.item.id === boundary.item.id;
         const pages = historyPages(threadId, "thread/items/list", cursor => this.threadItemsList({
             threadId,
             turnId,
             cursor,
             limit: HISTORY_PAGE_ITEMS,
             sortDirection: "asc",
-        }), page => page.some(entry => entry.item.id === lastItemId));
+        }), page => page.some(atBoundary));
         for await (const page of pages) {
-            const lastIndex = page.findIndex(entry => entry.item.id === lastItemId);
+            const lastIndex = page.findIndex(atBoundary);
             if (lastIndex >= 0) {
                 yield page.slice(0, lastIndex + 1);
                 return;
@@ -891,8 +893,8 @@ export class CodexAppServerClient {
         }
     }
 
-    async threadReadWithHistory(threadId: string): Promise<ThreadReadResponse> {
-        const response = await this.threadRead({threadId});
+    async threadReadWithHistory(threadId: string, knownThread?: ThreadReadResponse["thread"]): Promise<ThreadReadResponse> {
+        const response = knownThread === undefined ? await this.threadRead({threadId}) : {thread: knownThread};
         // Legacy stores reconstruct the rollout on each read; paging would repeat
         // that work. Full-history reads are only deprecated for paginated threads.
         if (response.thread.historyMode === "legacy") {

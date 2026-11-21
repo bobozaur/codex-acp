@@ -153,21 +153,25 @@ export class CommandReporter {
     }
 
     /** The reports of a command from the thread history. */
-    static history(item: CommandItem): ToolFacts[] {
+    static history(item: CommandItem, compactNonTerminal = false): ToolFacts[] {
         const start = startFacts(item);
         if (item.status === "inProgress") return [start];
-        return [start, {
+        const terminal = commandUsesTerminal(item);
+        const end = {
             ...completionFacts(item, false, false),
             standard: {
                 content: null,
                 commandEnd: {
                     output: item.aggregatedOutput ?? "",
                     exitCode: item.exitCode,
-                    terminal: commandUsesTerminal(item),
+                    terminal,
                     streamed: false,
                 },
             },
-        }];
+        };
+        // A historical read, search, or listing can report its final content at creation.
+        // Keep terminal creation ahead of its output and exit.
+        return compactNonTerminal && !terminal ? [{...start, ...end, report: "start"}] : [start, end];
     }
 }
 

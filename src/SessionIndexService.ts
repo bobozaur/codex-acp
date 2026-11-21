@@ -5,7 +5,6 @@
  * See `SessionIndex.ts` and `docs/air-extensions.md`.
  */
 
-import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk/unstable";
 import {RequestError} from "@agentclientprotocol/sdk/unstable";
 import {ACPSessionConnection, type AcpClientConnection} from "./ACPSessionConnection";
@@ -15,7 +14,7 @@ import type {CodexAcpClient} from "./CodexAcpClient";
 import type {SessionState} from "./CodexAcpServer";
 import {sessionNotFoundRequestError} from "./CodexThreadErrors";
 import {logger} from "./Logger";
-import {arePathBasenamesEqual, isAbsolutePathLike} from "./PathUtils";
+import {isAbsolutePathLike, normalizePathForComparison, sessionListCwdMatcher} from "./PathUtils";
 import type {Thread} from "./app-server/v2";
 import {
     AIR_ARCHIVED_KEY,
@@ -44,7 +43,7 @@ import {
 } from "./SessionIndex";
 import {deleteThread, sessionIndexRequestError, setThreadArchived} from "./SessionIndexMutations";
 import {SessionIndexTitles} from "./SessionIndexTitles";
-import {canonicalCwds, CodexWorktreeMarks, isUncPath, linkedWorktreeCwds} from "./SessionIndexWorktrees";
+import {CodexWorktreeMarks, isUncPath, sessionIndexCwds} from "./SessionIndexWorktrees";
 import {SessionForkOrigins} from "./SessionForkOrigins";
 import {SessionListSubscriptions, type SessionListSubscriptionTimings, type ThreadEntry} from "./SessionListSubscriptions";
 import {SessionWriteQueue} from "./SessionWriteQueue";
@@ -97,8 +96,7 @@ export class SessionIndexService {
             reader,
             codexHome: () => host.client().getHomePath(),
             rows: async (entries) => await this.rows(entries),
-            // The canonical path too outside a Git checkout, where linkedWorktreeCwds gives the cwd alone.
-            scopeCwds: (cwd) => [...new Set([...canonicalCwds(cwd), ...linkedWorktreeCwds(cwd)])],
+            scopeCwds: (cwd) => sessionIndexCwds(cwd, true) ?? [cwd],
             notify: async (changes) => {
                 await host.connection().notify(SESSION_LIST_CHANGES_METHOD, changes);
             },
@@ -155,7 +153,7 @@ export class SessionIndexService {
 
     /**
      * Answers `session/list`. Codex filters by the cwd and its worktrees, sorts by recency and limits the
-     * page. Only a relative cwd is filtered after the read. The list does not check the login: `thread/list`
+     * page. Relative and non-native paths are filtered after the read. The list does not check the login: `thread/list`
      * reads the local state DB and works without one.
      */
     async list(params: acp.ListSessionsRequest): Promise<SessionPage> {
@@ -191,7 +189,7 @@ export class SessionIndexService {
             throw RequestError.invalidParams({cwd: cwd ?? null}, "cwd must be an absolute path");
         }
         await this.host.ensureAppServer();
-        return {subscriptionId: await this.subscriptions.subscribe(cwd)};
+        return {subscriptionId: await this.subscriptions.subscribe(cwd.trim())};
     }
 
     /** `_session/list/unsubscribe {subscriptionId}`: idempotent. */
@@ -325,19 +323,15 @@ export class SessionIndexService {
     }
 
     private async readRows(cwd: string | null, options: SessionIndexListOptions, cursor: string | null): Promise<SessionPage> {
-        // Codex filters by an absolute cwd. A relative one keeps the basename filter of the old path, which the
-        // adapter applies to each page of the unfiltered list.
-        const relativeCwd = cwd !== null && !isAbsolutePathLike(cwd) ? cwd : null;
-        const cwds = cwd === null || relativeCwd !== null
-            ? null
-            : options.includeWorktrees ? linkedWorktreeCwds(cwd) : canonicalCwds(cwd);
+        const cwds = cwd === null ? null : sessionIndexCwds(cwd, options.includeWorktrees);
+        const matches = cwd !== null && cwds === null ? sessionListCwdMatcher(cwd) : undefined;
         const page = await this.host.runWithProcessCheck(() => readSessionIndexPage(
             (listParams) => this.host.client().appServerClient.threadList(listParams),
             cwds,
             options,
             cursor,
-            relativeCwd === null ? undefined : (thread) => arePathBasenamesEqual(thread.cwd, relativeCwd),
-            cwd === null || relativeCwd !== null ? cwd : path.resolve(cwd),
+            matches === undefined ? undefined : thread => matches(thread.cwd),
+            cwd !== null && isAbsolutePathLike(cwd) ? normalizePathForComparison(cwd) : cwd,
         ));
         // A list of every cwd does not read the Git files of each network share that a thread ran in.
         return {sessions: await this.rows(page.threads, cwds === null), nextCursor: page.nextCursor};

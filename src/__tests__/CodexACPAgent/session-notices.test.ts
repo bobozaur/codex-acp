@@ -180,6 +180,7 @@ describe("session notices", () => {
             turnsBackwardsCursor: null,
             itemsBackwardsCursor: null,
         });
+        vi.spyOn(appServer, "threadRead").mockResolvedValue({thread});
         vi.spyOn(appServer, "threadReadWithHistory").mockResolvedValue({thread});
         mockCompletedPrompt(fixture);
         await agent.initialize({protocolVersion: 1, clientCapabilities: noticeCapabilities});

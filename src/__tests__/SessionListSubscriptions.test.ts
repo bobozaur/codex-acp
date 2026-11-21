@@ -64,7 +64,9 @@ class FakeCodex {
     readonly threads = new Map<string, {thread: Thread, archived: boolean}>();
     readonly threadList = vi.fn(async (params: ThreadListParams): Promise<ThreadListResponse> => {
         const cwds = params.cwd === undefined || params.cwd === null ? null : [params.cwd].flat();
+        const sourceKinds = params.sourceKinds?.length ? params.sourceKinds : ["cli", "vscode"];
         const rows = [...this.threads.values()]
+            .filter(({thread}) => typeof thread.source === "string" && sourceKinds.includes(thread.source))
             .filter(entry => entry.archived === (params.archived ?? false))
             .filter(entry => cwds === null || cwds.includes(entry.thread.cwd))
             .map(entry => entry.thread)
@@ -228,26 +230,35 @@ describe("SessionListSubscriptions", () => {
         subscriptions.dispose();
     });
 
-    it("sends a thread that another process changed after a WAL write, read by one thread/list without cwd", async () => {
+    it("scans changed unarchived sessions using the session list sources after a WAL write", async () => {
         const {codex, subscriptions, sent, listener} = setup();
         codex.put(thread("a", {updatedAt: 1_000}));
-        codex.put(thread("b", {updatedAt: 900}));
+        codex.put(thread("legacy", {source: "unknown", updatedAt: 900}));
+        codex.put(thread("integration", {source: "appServer", updatedAt: 900}));
+        codex.put(thread("command", {source: "exec", updatedAt: 900}));
+        codex.put(thread("worker", {source: {subAgent: "review"}, updatedAt: 900}));
         const subscriptionId = await subscriptions.subscribe("/repo");
         codex.threadList.mockClear();
 
-        codex.update("b", {updatedAt: 1_100, name: "Renamed by a turn"});
+        codex.update("legacy", {updatedAt: 1_100, name: "Renamed legacy"});
+        codex.update("integration", {updatedAt: 1_200, name: "Renamed integration"});
+        codex.update("command", {updatedAt: 1_300});
+        codex.update("worker", {updatedAt: 1_400});
         listener().stateChanged();
         await vi.advanceTimersByTimeAsync(timings.quietMs - 1);
         expect(sent).toEqual([]);
         await vi.advanceTimersByTimeAsync(1);
 
-        expect(sent).toEqual([{subscriptionId, sessions: [expect.objectContaining({sessionId: "b", title: "Renamed by a turn"})], removed: []}]);
+        expect(sent).toEqual([{subscriptionId, sessions: [
+            expect.objectContaining({sessionId: "integration", title: "Renamed integration"}),
+            expect.objectContaining({sessionId: "legacy", title: "Renamed legacy"}),
+        ], removed: []}]);
         expect(codex.threadList.mock.calls.map(call => call[0])).toEqual([{
             cursor: null,
             limit: 20,
             sortKey: "updated_at",
             archived: false,
-            sourceKinds: [],
+            sourceKinds: ["cli", "vscode", "appServer", "unknown"],
             modelProviders: [],
             useStateDbOnly: true,
         }]);
@@ -785,32 +796,42 @@ describe("SessionListSubscriptions", () => {
         subscriptions.dispose();
     });
 
-    it("skips the helper threads of its own app-server and the threads the list does not show", async () => {
+    it("skips ephemeral threads and sources outside the list in notifications and direct reads", async () => {
         const {codex, subscriptions, sent} = setup();
         await subscriptions.subscribe("/repo");
-        codex.put(thread("title", {ephemeral: true}));
+        const title = codex.put(thread("title", {source: "appServer", ephemeral: true}));
+        const command = codex.put(thread("command", {source: "exec"}));
+        const worker = codex.put(thread("worker", {source: {subAgent: "review"}}));
+        const guardian = codex.put(thread("guardian", {source: "unknown", threadSource: "guardian_review"}));
+        codex.put(thread("memory", {source: "unknown", threadSource: "memory_consolidation"}));
         codex.put(thread("fresh", {preview: ""}));
 
-        subscriptions.observe(own("thread/started", {thread: codex.threads.get("title")!.thread}));
-        subscriptions.observe(own("turn/started", {threadId: "title", turn: {}}));
+        for (const excluded of [title, command, worker, guardian]) {
+            subscriptions.observe(own("thread/started", {thread: excluded}));
+            subscriptions.observe(own("thread/name/updated", {threadId: excluded.id}));
+        }
+        subscriptions.observe(own("thread/name/updated", {threadId: "memory"}));
         subscriptions.observe(own("thread/status/changed", {threadId: "fresh", status: {type: "idle"}}));
         await vi.advanceTimersByTimeAsync(timings.ownChangeDelayMs);
 
-        expect(codex.threadRead.mock.calls.map(call => call[0].threadId)).toEqual(["fresh"]);
+        subscriptions.observe(own("thread/name/updated", {threadId: "memory"}));
+        await vi.advanceTimersByTimeAsync(timings.ownChangeDelayMs);
+        expect(codex.threadRead.mock.calls.map(call => call[0].threadId)).toEqual(["memory", "fresh"]);
         expect(sent).toEqual([]);
         subscriptions.dispose();
     });
 
-    it("keeps the quiet time of a WAL write when an own notification flushes earlier", async () => {
-        const {codex, subscriptions, listener} = setup();
-        codex.put(thread("a"));
-        await subscriptions.subscribe("/repo");
+    it.each(["unknown", "appServer"] as const)("keeps the WAL quiet time when an own %s thread starts", async source => {
+        const {codex, subscriptions, sent, listener} = setup();
+        const imported = codex.put(thread("a", {source}));
+        const subscriptionId = await subscriptions.subscribe("/repo");
         const scansBefore = codex.scans().length;
 
         listener().stateChanged();
-        subscriptions.observe(own("thread/name/updated", {threadId: "a"}));
+        subscriptions.observe(own("thread/started", {thread: imported}));
         await vi.advanceTimersByTimeAsync(timings.ownChangeDelayMs);
         expect(codex.threadRead).toHaveBeenCalledTimes(1);
+        expect(sent).toEqual([{subscriptionId, sessions: [expect.objectContaining({sessionId: "a"})], removed: []}]);
         expect(codex.scans().length).toBe(scansBefore);
 
         await vi.advanceTimersByTimeAsync(timings.quietMs);

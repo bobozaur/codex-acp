@@ -16,7 +16,7 @@ function entry(turnId: string, id: string, text: string): ThreadItemEntry {
 function fixture() {
     const mock = createCodexMockTestFixture();
     const client = mock.getCodexAppServerClient();
-    const thread = {id: "history-thread", historyMode: "paginated", turns: []} as unknown as Thread;
+    const thread = {id: "history-thread", cwd: "/workspace", historyMode: "paginated", turns: []} as unknown as Thread;
     const read = vi.spyOn(client, "threadRead").mockResolvedValue({thread});
     const turns = vi.spyOn(client, "threadTurnsList").mockResolvedValue({data: [], nextCursor: null, backwardsCursor: null});
     const items = vi.spyOn(client, "threadItemsList").mockResolvedValue({data: [], nextCursor: null, backwardsCursor: null});
@@ -115,7 +115,7 @@ describe("thread history pagination", () => {
         });
         const result = await mock.getCodexAcpClient()[method]({sessionId: thread.id, cwd: "/workspace", mcpServers: []});
         expect(resume).toHaveBeenCalledWith(expect.objectContaining({excludeTurns: true}));
-        expect(read).not.toHaveBeenCalled();
+        expect(read).toHaveBeenCalledExactlyOnceWith({threadId: thread.id, includeTurns: false});
         expect(result.activeTurnId).toBe(activeTurn.id);
         expect(result.activePermissionProfileId).toBe("team");
         expect(result.turnSettings?.preservePermissionProfile).toBe(true);

@@ -31,7 +31,7 @@ describe("CodexACPAgent - loadSession", () => {
         const model = createTestModel();
         appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
         const thread = {
-            id: "native-input-history", historyMode: "legacy", turns: [{
+            id: "native-input-history", cwd: "/workspace", historyMode: "legacy", turns: [{
                 id: "turn-1", itemsView: "full", status: "completed", items: cases.map(({input}, index) => ({
                     type: "userMessage", id: `native-${index}`, clientId: null, content: [input],
                 })),
@@ -41,9 +41,15 @@ describe("CodexACPAgent - loadSession", () => {
             thread, model: model.id, modelProvider: "openai", cwd: "/workspace",
             approvalPolicy: "never", sandbox: {type: "dangerFullAccess"}, reasoningEffort: model.defaultReasoningEffort,
         });
+        appServer.threadRead = vi.fn().mockResolvedValue({thread});
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread});
         await agent.initialize({protocolVersion: 1, clientCapabilities: {}});
-        await agent.loadSession({sessionId: thread.id, cwd: "/workspace", mcpServers: []});
+        await expect(agent.loadSession({sessionId: thread.id, cwd: "/another-project", mcpServers: []}))
+            .rejects.toMatchObject({code: -32602, data: {cwd: "/workspace"}});
+        expect(appServer.threadResume).not.toHaveBeenCalled();
+        expect(() => agent.getSessionState(thread.id)).toThrow();
+        await agent.loadSession({sessionId: thread.id, cwd: "/workspace/.", mcpServers: []});
+        expect(agent.getSessionState(thread.id).cwd).toBe("/workspace");
         const updates = fixture.getAcpConnectionEvents([])
             .filter(event => event.method === "sessionUpdate")
             .map(event => event.args[0].update)
@@ -70,7 +76,7 @@ describe("CodexACPAgent - loadSession", () => {
             '# Files mentioned by the user:\n\n## screenshot.png: /workspace/screen #1.png\nImage attachment: true\n\n## My request:\nCompare',
         ];
         const thread = {
-            id: "attachment-history", historyMode: "legacy", turns: [{
+            id: "attachment-history", cwd: "/workspace", historyMode: "legacy", turns: [{
                 id: "turn-1", itemsView: "full", status: "completed", items: texts.map((text, index) => ({
                     type: "userMessage", id: `user-${index}`, clientId: null,
                     content: [
@@ -90,6 +96,7 @@ describe("CodexACPAgent - loadSession", () => {
             approvalPolicy: "never", sandbox: {type: "dangerFullAccess"},
             reasoningEffort: model.defaultReasoningEffort,
         });
+        appServer.threadRead = vi.fn().mockResolvedValue({thread});
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread});
 
         await agent.initialize({protocolVersion: 1, clientCapabilities: {}});
@@ -265,6 +272,7 @@ describe("CodexACPAgent - loadSession", () => {
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: root});
         // The adapter reads one turn of a child for each generation.
         appServer.threadRead = vi.fn().mockImplementation(({threadId}) => {
+            if (threadId === root.id) return Promise.resolve({thread: root});
             if (threadId === "orphan-history") return Promise.reject(new Error("missing child history"));
             return Promise.resolve({thread: {...child, historyMode: "legacy"}});
         });
@@ -398,7 +406,7 @@ describe("CodexACPAgent - loadSession", () => {
             reasoningEffort: model.defaultReasoningEffort,
         });
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: root});
-        appServer.threadRead = vi.fn().mockResolvedValue({thread: child});
+        appServer.threadRead = vi.fn().mockImplementation(async ({threadId}) => ({thread: threadId === root.id ? root : child}));
 
         await agent.initialize({
             protocolVersion: 1,
@@ -555,7 +563,7 @@ describe("CodexACPAgent - loadSession", () => {
         });
         appServer.threadReadWithHistory = vi.fn().mockResolvedValue({thread: root});
         appServer.threadRead = vi.fn().mockImplementation(({threadId}: {threadId: string}) =>
-            Promise.resolve({thread: makeThread(threadId, [turn(`${threadId}-turn-1`, []), turn(`${threadId}-turn-2`, [])])}));
+            Promise.resolve({thread: threadId === root.id ? root : makeThread(threadId, [turn(`${threadId}-turn-1`, []), turn(`${threadId}-turn-2`, [])])}));
 
         await agent.initialize({
             protocolVersion: 1,
@@ -793,6 +801,7 @@ describe("CodexACPAgent - loadSession", () => {
             sandbox: { type: "dangerFullAccess" },
             reasoningEffort: model.defaultReasoningEffort,
         });
+        codexAppServerClient.threadRead = vi.fn().mockResolvedValue({thread});
         codexAppServerClient.threadReadWithHistory = vi.fn().mockResolvedValue({
             thread: thread,
         });
@@ -817,14 +826,14 @@ describe("CodexACPAgent - loadSession", () => {
         };
         await codexAcpAgent.loadSession(loadParams);
 
-        expect(codexAppServerClient.threadReadWithHistory).toHaveBeenCalledWith(thread.id);
+        expect(codexAppServerClient.threadReadWithHistory).toHaveBeenCalledWith(thread.id, resumeThread);
         expect(codexAppServerClient.threadGoalGet).toHaveBeenCalledWith({ threadId: thread.id });
         await expect(fixture.getAcpConnectionDump([])).toMatchFileSnapshot(
             "data/load-session-history.json"
         );
     });
 
-    it("closes the session again when a history page fails after the replay started", async () => {
+    it("removes the local session when a history page fails and the detach RPC also fails", async () => {
         const fixture = createCodexMockTestFixture();
         const agent = fixture.getCodexAcpAgent();
         const client = fixture.getCodexAcpClient();
@@ -834,8 +843,10 @@ describe("CodexACPAgent - loadSession", () => {
         client.listSkills = vi.fn().mockResolvedValue({data: []});
         const model = createTestModel();
         appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+        const thread = {id: "session-1", historyMode: "paginated", turns: [], cwd: "/test/project", name: null, preview: ""};
+        appServer.threadRead = vi.fn().mockResolvedValue({thread});
         appServer.threadResume = vi.fn().mockResolvedValue({
-            thread: {id: "session-1", historyMode: "paginated", turns: [], cwd: "/test/project", name: null, preview: ""},
+            thread,
             itemsBackwardsCursor: "item:last",
             model: model.id,
             modelProvider: "openai",
@@ -849,13 +860,13 @@ describe("CodexACPAgent - loadSession", () => {
             .mockResolvedValueOnce({data: [message("last")], nextCursor: null, backwardsCursor: null})
             .mockResolvedValueOnce({data: [message("first")], nextCursor: "page-2", backwardsCursor: null})
             .mockRejectedValueOnce(new Error("History unavailable"));
-        const closeSpy = vi.spyOn(client, "closeSession").mockResolvedValue(undefined as never);
+        const unsubscribe = vi.spyOn(appServer, "threadUnsubscribe").mockRejectedValue(new Error("Detach unavailable"));
 
         await agent.initialize({protocolVersion: 1});
         await expect(agent.loadSession({sessionId: "session-1", cwd: "/test/project", mcpServers: []}))
             .rejects.toThrow("History unavailable");
 
-        expect(closeSpy).toHaveBeenCalledWith("session-1");
+        expect(unsubscribe).toHaveBeenCalledExactlyOnceWith({threadId: "session-1"});
         expect(() => agent.getSessionState("session-1")).toThrow();
     });
 
@@ -869,8 +880,10 @@ describe("CodexACPAgent - loadSession", () => {
         client.listSkills = vi.fn().mockResolvedValue({data: []});
         const model = createTestModel();
         appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+        const thread = {id: "session-1", historyMode: "paginated", turns: [], cwd: "/test/project", name: null, preview: ""};
+        appServer.threadRead = vi.fn().mockResolvedValue({thread});
         appServer.threadResume = vi.fn().mockResolvedValue({
-            thread: {id: "session-1", historyMode: "paginated", turns: [], cwd: "/test/project", name: null, preview: ""},
+            thread,
             itemsBackwardsCursor: "item:last",
             model: model.id,
             modelProvider: "openai",
@@ -988,6 +1001,7 @@ describe("CodexACPAgent - loadSession", () => {
             sandbox: { type: "dangerFullAccess" },
             reasoningEffort: model.defaultReasoningEffort,
         });
+        codexAppServerClient.threadRead = vi.fn().mockResolvedValue({thread});
         codexAppServerClient.threadReadWithHistory = vi.fn().mockResolvedValue({
             thread: thread,
         });
@@ -1080,6 +1094,7 @@ describe("CodexACPAgent - loadSession", () => {
             sandbox: { type: "dangerFullAccess" },
             reasoningEffort: model.defaultReasoningEffort,
         });
+        codexAppServerClient.threadRead = vi.fn().mockResolvedValue({thread});
         codexAppServerClient.threadReadWithHistory = vi.fn().mockResolvedValue({
             thread: thread,
         });

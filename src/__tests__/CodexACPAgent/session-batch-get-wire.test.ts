@@ -56,6 +56,44 @@ describe.each([1, 2] as const)("_session/batch_get over ACP v%i", version => {
         expect(backend.mock.calls).toEqual(ids.map(threadId => ["thread/read", {threadId, includeTurns: false}]));
     });
 
+    it("lists app-server and unknown sources and returns the same rows from batch metadata", async () => {
+        const {request, backend} = await connect(version, ["sessionIndex"]);
+        const thread = {
+            cwd: "/repo",
+            ephemeral: false,
+            preview: "Earlier work",
+            name: "Earlier work",
+            recencyAt: 2,
+            updatedAt: 2,
+            status: {type: "notLoaded"},
+        };
+        const rows = [
+            {kind: "appServer", archived: false,
+                thread: {...thread, id: "integration", source: "appServer", path: "/codex/sessions/rollout-integration.jsonl"}},
+            {kind: "unknown", archived: true,
+                thread: {...thread, id: "legacy", source: "unknown", path: "/codex/archived_sessions/rollout-legacy.jsonl"}},
+            {kind: "exec", archived: false,
+                thread: {...thread, id: "command", source: "exec", path: "/codex/sessions/rollout-command.jsonl"}},
+        ];
+        backend.mockImplementation(async (method: string, params: any) => {
+            if (method === "thread/list") {
+                const kinds = params.sourceKinds?.length ? params.sourceKinds : ["cli", "vscode"];
+                return {
+                    data: rows.filter(row => row.archived === params.archived && kinds.includes(row.kind)).map(row => row.thread),
+                    nextCursor: null,
+                    backwardsCursor: null,
+                };
+            }
+            if (method === "thread/read") return {thread: rows.find(row => row.thread.id === params.threadId)!.thread};
+            return {};
+        });
+        const all = await request("session/list", {_meta: {jetbrains: {air: {list: {archived: "all"}}}}});
+        expect(all.sessions.map((row: any) => [row.sessionId, row._meta.jetbrains.air.archived]))
+            .toEqual([["integration", false], ["legacy", true]]);
+        const batch = await request(SESSION_BATCH_GET_METHOD, {sessionIds: ["integration", "legacy", "command"]});
+        expect(batch.sessions).toEqual(all.sessions);
+    });
+
     it("rejects malformed, extra, duplicate and blank input without store work", async () => {
         const {request, backend} = await connect(version, ["sessionIndex"]);
         const invalid = [undefined, null, [], "ids", {}, {sessionIds: null}, {sessionIds: "a"},

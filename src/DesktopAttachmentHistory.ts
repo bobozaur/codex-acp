@@ -1,27 +1,5 @@
 import type {ContentBlock} from "@agentclientprotocol/sdk/unstable";
-import {pathToFileURL} from "node:url";
-
-export function attachmentFileUri(path: string): string | null {
-    if (path.startsWith("file://")) {
-        try {
-            return new URL(path).href;
-        } catch {
-            return null;
-        }
-    }
-    if (/^[A-Za-z]:[\\/]/.test(path)) {
-        return `file:///${path.replaceAll("\\", "/").split("/").map(encodeURIComponent).join("/").replace(/^([A-Za-z])%3A/, "$1:")}`;
-    }
-    if (/^\\\\[^\\]+\\/.test(path)) {
-        const [host, ...segments] = path.slice(2).split("\\");
-        try {
-            return new URL(`file://${host}/${segments.map(encodeURIComponent).join("/")}`).href;
-        } catch {
-            return null;
-        }
-    }
-    return path.startsWith("/") ? pathToFileURL(path).href : null;
-}
+import {fileUriFromPath} from "./PathUtils";
 
 /** Converts the known Desktop attachment envelope into history content blocks. */
 export function desktopAttachmentHistory(text: string): ContentBlock[] | null {
@@ -49,7 +27,7 @@ export function desktopAttachmentHistory(text: string): ContentBlock[] | null {
                 return null;
             }
         }
-        const uri = attachmentFileUri(attachment[2]!);
+        const uri = fileUriFromPath(attachment[2]!);
         if (title.length === 0 || uri === null) return null;
         attachments.push({type: "resource_link", name: title, uri});
     }

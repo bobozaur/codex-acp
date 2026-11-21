@@ -107,6 +107,27 @@ describe("Subagent interactions", () => {
         expect(send).not.toHaveBeenCalled();
     });
 
+    it.each(cases)("uses installed handlers for %s received during session setup", async method => {
+        const setup = deferred();
+        const startupHandler = vi.fn();
+        const installedHandler = vi.fn();
+        const {subscriptions, handlers} = interactionSubscriptions(() => false);
+        const subscribe = (send: typeof startupHandler) => subscriptions.subscribe({
+            rootSessionId: "root", supportsSubagents: true, dispatch: vi.fn(), enqueueInteraction: vi.fn(),
+            approvalHandler: {handleCommandExecution: send, handleFileChange: send, handlePermissionsRequest: send},
+            elicitationHandler: {handleElicitation: send, handleUserInput: send},
+            waitForRootNotifications: () => setup.promise, waitForChildSession: async () => null,
+        });
+        subscribe(startupHandler);
+        const params = {threadId: "root", turnId: "turn", itemId: "item"};
+        const response = handlers.get("root")![method]!(params as never);
+        subscribe(installedHandler);
+        setup.resolve();
+        await response;
+        expect(installedHandler).toHaveBeenCalledExactlyOnceWith(params);
+        expect(startupHandler).not.toHaveBeenCalled();
+    });
+
     it("preserves the shared request ID when attributing a child interaction to its root", async () => {
         const params = {threadId: "child", turnId: "turn", itemId: "item"};
         tagAppServerRequest(params, "shared-request");

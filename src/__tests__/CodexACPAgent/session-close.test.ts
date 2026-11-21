@@ -293,6 +293,7 @@ describe("ACP session close", () => {
             return resume.promise;
         });
         const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession");
+        const detachSessionSpy = vi.spyOn(codexAcpClient, "detachSession");
 
         const resumePromise = codexAcpAgent.resumeSession({
             sessionId,
@@ -305,8 +306,10 @@ describe("ACP session close", () => {
         resume.resolve(createSessionMetadata());
 
         await expect(resumePromise).rejects.toThrow("Invalid request");
-        expect(closeSessionSpy).toHaveBeenCalledTimes(2);
+        expect(closeSessionSpy).toHaveBeenCalledOnce();
         expect(closeSessionSpy).toHaveBeenLastCalledWith(sessionId);
+        expect(detachSessionSpy).toHaveBeenCalledTimes(2);
+        expect(detachSessionSpy).toHaveBeenLastCalledWith(sessionId);
         expect(() => codexAcpAgent.getSessionState(sessionId)).toThrow(`Session ${sessionId} not found`);
     });
 
@@ -320,7 +323,7 @@ describe("ACP session close", () => {
                 return staleResume.promise;
             })
             .mockResolvedValueOnce(createSessionMetadata());
-        const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession");
+        const detachSessionSpy = vi.spyOn(codexAcpClient, "detachSession");
 
         const staleResumePromise = codexAcpAgent.resumeSession({
             sessionId,
@@ -339,7 +342,7 @@ describe("ACP session close", () => {
         staleResume.resolve(createSessionMetadata());
 
         await expect(staleResumePromise).rejects.toThrow("Invalid request");
-        expect(closeSessionSpy).toHaveBeenCalledTimes(1);
+        expect(detachSessionSpy).toHaveBeenCalledOnce();
         expect(codexAcpAgent.getSessionState(sessionId).sessionId).toBe(sessionId);
     });
 
@@ -354,7 +357,7 @@ describe("ACP session close", () => {
                 return staleResume.promise;
             })
             .mockResolvedValueOnce(createSessionMetadata());
-        const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession")
+        const detachSessionSpy = vi.spyOn(codexAcpClient, "detachSession")
             .mockResolvedValueOnce()
             .mockReturnValueOnce(staleUnsubscribe.promise);
 
@@ -369,7 +372,7 @@ describe("ACP session close", () => {
         staleResume.resolve(createSessionMetadata());
 
         await vi.waitFor(() => {
-            expect(closeSessionSpy).toHaveBeenCalledTimes(2);
+            expect(detachSessionSpy).toHaveBeenCalledTimes(2);
         });
 
         await expect(codexAcpAgent.resumeSession({
@@ -403,7 +406,7 @@ describe("ACP session close", () => {
             resumeStarted.resolve();
             return staleResume.promise;
         });
-        const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession")
+        const detachSessionSpy = vi.spyOn(codexAcpClient, "detachSession")
             .mockReturnValueOnce(activeUnsubscribe.promise)
             .mockReturnValueOnce(staleUnsubscribe.promise);
 
@@ -416,12 +419,12 @@ describe("ACP session close", () => {
         const closePromise = codexAcpAgent.closeSession({sessionId});
 
         await vi.waitFor(() => {
-            expect(closeSessionSpy).toHaveBeenCalledTimes(1);
+            expect(detachSessionSpy).toHaveBeenCalledTimes(1);
         });
 
         staleResume.resolve(createSessionMetadata());
         await vi.waitFor(() => {
-            expect(closeSessionSpy).toHaveBeenCalledTimes(2);
+            expect(detachSessionSpy).toHaveBeenCalledTimes(2);
         });
 
         activeUnsubscribe.resolve(undefined);
@@ -441,7 +444,9 @@ describe("ACP session close", () => {
             onSubscribed?.();
             throw new Error("model list failed");
         });
-        const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession").mockResolvedValue();
+        const appServer = fixture.getCodexAppServerClient();
+        const unsubscribe = vi.spyOn(appServer, "threadUnsubscribe");
+        const listBackgroundTerminals = vi.spyOn(appServer, "threadBackgroundTerminalsList");
 
         await expect(codexAcpAgent.resumeSession({
             sessionId,
@@ -449,7 +454,8 @@ describe("ACP session close", () => {
             mcpServers: [],
         })).rejects.toThrow("model list failed");
 
-        expect(closeSessionSpy).toHaveBeenCalledWith(sessionId);
+        expect(unsubscribe).toHaveBeenCalledExactlyOnceWith({threadId: sessionId});
+        expect(listBackgroundTerminals).not.toHaveBeenCalled();
     });
 
     it("unsubscribes a resume that fails during account read after app-server subscription", async () => {
@@ -462,7 +468,9 @@ describe("ACP session close", () => {
             return createSessionMetadata();
         });
         vi.spyOn(codexAcpClient, "getAccount").mockRejectedValue(new Error("account read failed"));
-        const closeSessionSpy = vi.spyOn(codexAcpClient, "closeSession").mockResolvedValue();
+        const appServer = fixture.getCodexAppServerClient();
+        const unsubscribe = vi.spyOn(appServer, "threadUnsubscribe");
+        const listBackgroundTerminals = vi.spyOn(appServer, "threadBackgroundTerminalsList");
 
         await expect(codexAcpAgent.resumeSession({
             sessionId,
@@ -470,7 +478,8 @@ describe("ACP session close", () => {
             mcpServers: [],
         })).rejects.toThrow("account read failed");
 
-        expect(closeSessionSpy).toHaveBeenCalledWith(sessionId);
+        expect(unsubscribe).toHaveBeenCalledExactlyOnceWith({threadId: sessionId});
+        expect(listBackgroundTerminals).not.toHaveBeenCalled();
     });
 
     it("does not route stale turn notifications into a reopened session", async () => {

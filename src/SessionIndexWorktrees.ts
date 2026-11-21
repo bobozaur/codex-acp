@@ -11,6 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import {canonicalNativePath as canonicalize, nativeSessionListCwd} from "./PathUtils";
 
 interface RepositoryIdentity {
     /** The canonical shared Git directory of the repository and its worktrees. */
@@ -27,35 +28,37 @@ interface RepositoryIdentity {
 /**
  * The cwds whose sessions belong to the list of `cwd`: `cwd` itself, its
  * canonical form, and the same relative directory in the primary checkout and
- * in each linked worktree that still exists. Returns only `cwd` when it is not
- * in a Git checkout or the metadata does not validate.
+ * in each linked worktree that still exists. Invalid Git metadata leaves the
+ * requested and canonical paths in scope.
  */
-export function linkedWorktreeCwds(cwd: string): string[] {
+export function linkedWorktreeCwds(cwd: string, canonical = canonicalize(cwd)): string[] {
+    const paths = cwdSpellings(cwd, canonical);
+    if (canonical === null) return paths;
     try {
-        return linkedWorktreeCwdsOrNull(cwd) ?? [cwd];
+        return linkedWorktreeCwdsOrNull(canonical, paths) ?? paths;
     } catch {
-        return [cwd];
+        return paths;
     }
 }
 
-/** `cwd` itself and, when it differs, its canonical form: the cwds of a list without worktrees. */
-export function canonicalCwds(cwd: string): string[] {
-    const canonical = canonicalize(cwd);
+/** Native cwd filters shared by the index and subscriptions. Non-native cwd matching uses the retained spelling. */
+export function sessionIndexCwds(cwd: string, includeWorktrees: boolean): string[] | null {
+    const native = nativeSessionListCwd(cwd);
+    if (native === null) return null;
+    // Native Windows cwd detection already resolves the path.
+    const canonical = process.platform === "win32" ? native : canonicalize(native);
+    return includeWorktrees ? linkedWorktreeCwds(cwd, canonical) : cwdSpellings(cwd, canonical);
+}
+
+function cwdSpellings(cwd: string, canonical: string | null): string[] {
     return canonical === null || canonical === cwd ? [cwd] : [cwd, canonical];
 }
 
-function linkedWorktreeCwdsOrNull(cwd: string): string[] | null {
+function linkedWorktreeCwdsOrNull(cwd: string, paths: string[]): string[] | null {
     const identity = repositoryIdentity(cwd);
     if (identity === null) return null;
-    const currentCwd = canonicalize(cwd);
-    if (currentCwd === null) return null;
-
-    const result = [cwd];
-    const seen = new Set([cwd]);
-    if (!seen.has(currentCwd)) {
-        seen.add(currentCwd);
-        result.push(currentCwd);
-    }
+    const result = [...paths];
+    const seen = new Set(paths);
 
     if (identity.primaryRoot !== null) {
         appendLinkedCwd(result, seen, identity.primaryRoot, identity);
@@ -94,10 +97,8 @@ function appendLinkedCwd(result: string[], seen: Set<string>, checkoutRoot: stri
     }
 }
 
-function repositoryIdentity(cwd: string): RepositoryIdentity | null {
-    const canonicalCwd = canonicalize(cwd);
-    if (canonicalCwd === null || !isDirectory(canonicalCwd)) return null;
-
+function repositoryIdentity(canonicalCwd: string): RepositoryIdentity | null {
+    if (!isDirectory(canonicalCwd)) return null;
     const repoRoot = findGitRepoRoot(canonicalCwd);
     if (repoRoot === null) return null;
     const checkoutRoot = canonicalize(repoRoot);
@@ -173,15 +174,6 @@ function readGitPath(file: string, relativeTo: string, prefix: string): string |
     const value = contents.slice(prefix.length).trim();
     if (value.length === 0 || value.includes("\n") || value.includes("\r")) return null;
     return canonicalize(path.resolve(relativeTo, value));
-}
-
-function canonicalize(value: string): string | null {
-    if (!path.isAbsolute(value)) return null;
-    try {
-        return fs.realpathSync.native(value);
-    } catch {
-        return null;
-    }
 }
 
 function lstat(value: string): fs.Stats | null {

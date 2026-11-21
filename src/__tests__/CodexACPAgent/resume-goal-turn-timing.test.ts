@@ -122,6 +122,28 @@ describe('baseline tracker installed before thread/resume, so an auto-started go
         ]);
     });
 
+    it.each([undefined, {type: "start"}] as const)("ignores an older completion while restoring an active turn (replay: %j)", async replayFrom => {
+        const client = await connectSession(2);
+        closeClient = () => client.connection.close();
+        const thread: Thread = {...createThread(), id: secondSessionId, status: {type: "active", activeFlags: []},
+            turns: [createTurn("inProgress", secondTurnId)]};
+        client.setCodexResponse("thread/resume", async () => {
+            client.emit(turnCompletedFor(secondSessionId, "older-turn"));
+            return {...codexResponse("thread/resume") as Record<string, unknown>, materialized: true, thread};
+        });
+        client.setCodexResponse("thread/read", async () => ({thread}));
+
+        await client.request("session/resume", {sessionId: secondSessionId, cwd, replayFrom});
+        expect(stateUpdates(client.transcript)).toEqual([{state: "running"}]);
+
+        client.emit(turnCompletedFor(secondSessionId, secondTurnId));
+        await settle();
+        expect(stateUpdates(client.transcript)).toEqual([
+            {state: "running"},
+            {state: "idle", stopReason: "end_turn"},
+        ]);
+    });
+
     it('v1 session/resume: renders the goal turn started during setup', async () => {
         const client = await connectSession(1);
         closeClient = () => client.connection.close();

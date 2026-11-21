@@ -104,7 +104,7 @@ describe("paginated thread history", () => {
         } as any);
         const read = vi.spyOn(appServer, "threadRead").mockImplementation(async ({includeTurns}) => ({
             thread: {
-                id: "history", historyMode: mode, name: "Later metadata",
+                id: "history", cwd: "/workspace", historyMode: mode, name: "Later metadata",
                 turns: includeTurns ? stored : [],
             } as any,
         }));
@@ -116,9 +116,9 @@ describe("paginated thread history", () => {
         expect(loaded.thread.turns).toEqual([]);
         expect(await collect(loaded.history)).toEqual(expectedIds);
         expect(loaded.thread.name).toBe(mode === "paginated" ? "Resume metadata" : "Later metadata");
-        expect(read.mock.calls).toEqual(mode === "paginated" ? [] : [
-            [{threadId: "history"}],
-            [{threadId: "history", includeTurns: true}],
+        expect(read.mock.calls).toEqual([
+            [{threadId: "history", includeTurns: false}],
+            ...(mode === "paginated" ? [] : [[{threadId: "history", includeTurns: true}]]),
         ]);
         expect(pages).toHaveBeenCalledTimes(pageCalls);
     });
@@ -197,6 +197,23 @@ describe("paginated thread history", () => {
 
         expect(received).toEqual([3, 3, 1]);
         expect(pages).toHaveBeenCalledTimes(4);
+    });
+
+    it("stops at the resume item in its own turn when an earlier turn reused the item ID", async () => {
+        const appServer = createCodexMockTestFixture().getCodexAppServerClient();
+        const [earlier, resumed, later] = [messageTurn("earlier"), messageTurn("resumed"), messageTurn("later")];
+        const boundary = resumed.items[1]!;
+        earlier.items[1] = {...earlier.items[1]!, id: boundary.id};
+        vi.spyOn(appServer, "threadItemsList")
+            .mockImplementation(itemStore([earlier, resumed, later]))
+            .mockResolvedValueOnce({
+                data: [{turnId: resumed.id, item: boundary, startedAtMs: null, completedAtMs: null}],
+                nextCursor: null,
+                backwardsCursor: null,
+            });
+
+        const entries = appServer.threadItemEntryPages("history", {lastItemCursor: "resume-boundary"});
+        expect(await collect(entries)).toEqual(["earlier-input", boundary.id, "resumed-input", boundary.id]);
     });
 
     it("reads standalone legacy history without requiring a pagination API", async () => {

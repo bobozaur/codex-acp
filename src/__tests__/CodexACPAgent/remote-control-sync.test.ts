@@ -195,6 +195,77 @@ describe("CodexACPAgent - remote-control synchronization", () => {
         expect(fixture.getCodexAcpAgent().getSessionState(sessionId).currentTurnId).toBeNull();
     });
 
+    it.each([
+        ["loadSession", false], ["loadSession", true], ["resumeSession", false], ["resumeSession", true],
+    ] as const)("keeps the open subscription when %s fails (native attachment: %s)", async (method, subscribed) => {
+        const fixture = createCodexMockTestFixture();
+        const sessionId = "already-open";
+        const agent = fixture.getCodexAcpAgent();
+        await openNewSessions(fixture, [sessionId]);
+        const client = fixture.getCodexAcpClient();
+        const detach = vi.spyOn(client, "detachSession");
+        vi.spyOn(client, method).mockImplementationOnce(async (_request, onSubscribed) => {
+            if (subscribed) onSubscribed?.();
+            fixture.sendServerNotification(userMessageStarted(sessionId, "during-setup", "phone", "During setup"));
+            throw new Error("Setup rejected");
+        });
+
+        await expect(agent[method]({sessionId, cwd: "", mcpServers: []})).rejects.toThrow("Setup rejected");
+        fixture.sendServerNotification(userMessageStarted(sessionId, "after-setup", "phone", "After setup"));
+        await waitForNotifications(fixture, [sessionId]);
+
+        expect(userMessageUpdates(fixture)).toEqual([
+            {sessionId, messageId: "during-setup", text: "During setup"},
+            {sessionId, messageId: "after-setup", text: "After setup"},
+        ]);
+        expect(detach).not.toHaveBeenCalled();
+    });
+
+    it("does not shut down a foreign thread after its first open rejects", async () => {
+        const fixture = createCodexMockTestFixture();
+        const sessionId = "foreign-thread";
+        const agent = fixture.getCodexAcpAgent();
+        await openNewSessions(fixture, ["existing-thread"]);
+        const client = fixture.getCodexAcpClient();
+        vi.spyOn(client, "resumeSession").mockRejectedValueOnce(new Error("Setup rejected before subscribing"));
+        const close = vi.spyOn(client, "closeSession");
+
+        await expect(agent.resumeSession({sessionId, cwd: "", mcpServers: []})).rejects.toThrow("Setup rejected");
+        await expect(agent.closeSession({sessionId})).resolves.toEqual({});
+        expect(close).not.toHaveBeenCalled();
+    });
+
+    it("detaches an active thread after a history read fails without interrupting shared work", async () => {
+        const fixture = createCodexMockTestFixture();
+        const sessionId = "foreign-thread";
+        const agent = fixture.getCodexAcpAgent();
+        const model = createTestModel();
+        await openNewSessions(fixture, ["existing-thread"], model);
+        vi.spyOn(fixture.getCodexAcpClient(), "loadSession").mockImplementationOnce(async (_request, onSubscribed) => {
+            onSubscribed?.();
+            const turnId = "remote-turn";
+            fixture.sendServerNotification(userMessageStarted(sessionId, "during-setup", "phone", "During setup", turnId));
+            const thread = createThread(sessionId, [createTurn(turnId, "inProgress")]);
+            const history = (async function* () { throw new Error("History read failed"); })();
+            return {
+                sessionId, thread, history, threadSnapshot: thread, activeTurnId: turnId,
+                currentModelId: ModelId.create(model.id, model.defaultReasoningEffort).toString(),
+                models: [model], collaborationMode: "default", modelProvider: "test-provider",
+                currentServiceTier: null, additionalDirectories: [],
+            };
+        });
+        fixture.clearCodexConnectionDump();
+
+        await expect(agent.loadSession({sessionId, cwd: "", mcpServers: []})).rejects.toThrow("History read failed");
+        const teardown = fixture.getCodexConnectionEvents([]).flatMap(event => event.eventType === "request"
+            && (event.method === "turn/interrupt" || event.method.startsWith("thread/backgroundTerminals/")
+                || event.method === "thread/unsubscribe") ? [event.method] : []);
+        expect(teardown).toEqual(["thread/unsubscribe"]);
+        expect(() => agent.getSessionState(sessionId)).toThrow("not found");
+        await waitForNotifications(fixture, [sessionId]);
+        expect(userMessageUpdates(fixture)).toEqual([]);
+    });
+
     it("rebinds remote event delivery after replacing the app-server client", async () => {
         const replacementFixture = createCodexMockTestFixture();
         const replacement = replacementFixture.getCodexAcpClient();

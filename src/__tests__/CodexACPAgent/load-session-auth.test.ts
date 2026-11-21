@@ -16,8 +16,10 @@ function loadFixture(): CodexMockTestFixture {
     client.listSkills = vi.fn().mockResolvedValue({data: []});
     const model = createTestModel();
     appServer.listModels = vi.fn().mockResolvedValue({data: [model], nextCursor: null});
+    const thread = {id: SESSION_ID, historyMode: "paginated", turns: [], cwd: "/test/project", name: null, preview: ""};
+    appServer.threadRead = vi.fn().mockResolvedValue({thread});
     appServer.threadResume = vi.fn().mockResolvedValue({
-        thread: {id: SESSION_ID, historyMode: "paginated", turns: [], cwd: "/test/project", name: null, preview: ""},
+        thread,
         itemsBackwardsCursor: "item:last",
         model: model.id,
         modelProvider: "openai",
@@ -62,18 +64,19 @@ describe("CodexACPAgent - loadSession auth", () => {
         expect(fixture.getCodexAcpAgent().getSessionState(SESSION_ID).account).toEqual(SIGNED_IN.account);
     });
 
-    it("fails with auth_required and closes the resumed thread when the agent needs a login", async () => {
+    it("returns auth_required and detaches the resumed thread when the agent needs a login", async () => {
         const fixture = loadFixture();
-        const client = fixture.getCodexAcpClient();
         const appServer = fixture.getCodexAppServerClient();
         appServer.accountRead = vi.fn().mockResolvedValue({account: null, requiresOpenaiAuth: true});
-        const closeSpy = vi.spyOn(client, "closeSession").mockResolvedValue(undefined as never);
+        const unsubscribe = vi.spyOn(appServer, "threadUnsubscribe");
+        const listBackgroundTerminals = vi.spyOn(appServer, "threadBackgroundTerminalsList");
         await initialize(fixture);
 
         await expect(fixture.getCodexAcpAgent().loadSession({sessionId: SESSION_ID, cwd: "/test/project", mcpServers: []}))
             .rejects.toMatchObject({code: -32000});
 
-        expect(closeSpy).toHaveBeenCalledWith(SESSION_ID);
+        expect(unsubscribe).toHaveBeenCalledExactlyOnceWith({threadId: SESSION_ID});
+        expect(listBackgroundTerminals).not.toHaveBeenCalled();
         expect(appServer.threadItemsList).not.toHaveBeenCalled();
         expect(() => fixture.getCodexAcpAgent().getSessionState(SESSION_ID)).toThrow();
     });
